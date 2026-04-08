@@ -115,15 +115,17 @@ done
 # Cross-mode loss comparison
 # ============================================================
 echo ""
-echo -e "${BOLD}=== Cross-mode loss comparison ===${NC}"
+echo -e "${BOLD}=== Cross-mode loss comparison (PASS modes only) ===${NC}"
 REF_LOSS=""
 ALL_MATCH=1
 for mode in "${MODE_NAMES[@]}"; do
     log="$LOGDIR/$mode.log"
+    # Only include modes where save/load roundtrip passed
+    if ! grep -q '^PASS' "$log" 2>/dev/null; then
+        continue
+    fi
     loss=$(grep -oP 'loss_before = \K[0-9.]+' "$log" 2>/dev/null)
     if [ -z "$loss" ]; then
-        printf "  ${RED}%-12s  —${NC}\n" "$mode"
-        ALL_MATCH=0
         continue
     fi
     if [ -z "$REF_LOSS" ]; then

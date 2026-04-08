@@ -1112,9 +1112,11 @@ def get_parallel_materialization_context(
         if isinstance(shard_style, str):
             from .integrations.tensor_parallel import MoEShardOperation
 
+            # Use TP sub-mesh for sharding, not the full (fsdp, tp) mesh
+            tp_mesh = device_mesh["tp"] if device_mesh.ndim > 1 and "tp" in (device_mesh.mesh_dim_names or ()) else device_mesh
             param_name = renamed_key.rsplit(".", 1)[1] if "." in renamed_key else renamed_key
             return ParallelMaterializationContext(
-                distributed_operation=MoEShardOperation(device_mesh, param_name, empty_param),
+                distributed_operation=MoEShardOperation(tp_mesh, param_name, empty_param),
                 tensor_idx=tensor_idx,
                 device=get_device(device_map, renamed_key, valid_torch_device=True),
             )

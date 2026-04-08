@@ -845,7 +845,7 @@ class TestDtensorShardOperation(unittest.TestCase):
         torch.testing.assert_close(op.shard_tensor(tensor), tensor)
 
     def test_1d_shard_fast_path(self):
-        """Single shard dim → get_tensor_shard fast path."""
+        #TODO(3outeille): double check fast path
         tensor = torch.arange(16).reshape(4, 4).float()
         for rank, expected in [(0, tensor[:2]), (1, tensor[2:])]:
             mesh = FakeMesh(shape=(2,), rank=rank)

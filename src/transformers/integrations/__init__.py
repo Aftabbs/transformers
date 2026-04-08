@@ -301,10 +301,6 @@ if TYPE_CHECKING:
     else:
         from .executorch import TorchExportableModuleWithStaticCache, convert_and_export_with_cache
 
-    from .tensor_parallel import (  # noqa: F401
-        gather_state_dict_for_save,
-    )
-
     try:
         if not is_torch_greater_or_equal("2.5"):
             raise OptionalDependencyNotAvailable()

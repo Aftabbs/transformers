@@ -77,7 +77,7 @@ from .integrations.sdpa_paged import sdpa_attention_paged_forward
 from .integrations.tensor_parallel import (
     _get_parameter_tp_plan,
     apply_tensor_parallel,
-    gather_state_dict_for_save,
+    gather_full_state_dict,
     verify_tp_plan,
 )
 from .loss.loss_utils import LOSS_MAPPING
@@ -3270,64 +3270,58 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if self._auto_class is not None:
             custom_object_save(self, save_directory, config=self.config)
 
+        # Don't persist distributed_config in saved config — it's runtime-only
+        # (otherwise AutoConfig absorbs it on reload, preventing from_pretrained from seeing it as a kwarg).
+        # Keep a runtime copy around because TP/FSDP save helpers still rely on it after config serialization.
+        distributed_config = getattr(model_to_save.config, "distributed_config", None)
+        if distributed_config is not None:
+            del model_to_save.config.distributed_config
+
         # Save the config
-        if is_main_process:
-            if not _hf_peft_config_loaded:
-                model_to_save.config.save_pretrained(save_directory)
-            if self.can_generate():
-                model_to_save.generation_config.save_pretrained(save_directory)
+        try:
+            if is_main_process:
+                if not _hf_peft_config_loaded:
+                    model_to_save.config.save_pretrained(save_directory)
+                if self.can_generate():
+                    model_to_save.generation_config.save_pretrained(save_directory)
 
-            if _hf_peft_config_loaded:
-                logger.info(
-                    "Detected adapters on the model, saving the model in the PEFT format, only adapter weights will be saved."
-                )
-                state_dict = model_to_save.get_adapter_state_dict(state_dict=state_dict)
-
-                if save_peft_format:
+                if _hf_peft_config_loaded:
                     logger.info(
-                        "To match the expected format of the PEFT library, all keys of the state dict of adapters will be prepended with `base_model.model`."
+                        "Detected adapters on the model, saving the model in the PEFT format, only adapter weights will be saved."
                     )
-                    peft_state_dict = {}
-                    for key, value in state_dict.items():
-                        peft_state_dict[f"base_model.model.{key}"] = value
-                    state_dict = peft_state_dict
+                    state_dict = model_to_save.get_adapter_state_dict(state_dict=state_dict)
 
-                active_adapter = self.active_adapters()
+                    if save_peft_format:
+                        logger.info(
+                            "To match the expected format of the PEFT library, all keys of the state dict of adapters will be prepended with `base_model.model`."
+                        )
+                        peft_state_dict = {}
+                        for key, value in state_dict.items():
+                            peft_state_dict[f"base_model.model.{key}"] = value
+                        state_dict = peft_state_dict
 
-                if len(active_adapter) > 1:
-                    raise ValueError(
-                        "Multiple active adapters detected, saving multiple active adapters is not supported yet. You can save adapters separately one by one "
-                        "by iteratively calling `model.set_adapter(adapter_name)` then `model.save_pretrained(...)`"
-                    )
-                active_adapter = active_adapter[0]
+                    active_adapter = self.active_adapters()
 
-                current_peft_config = self.peft_config[active_adapter]
-                current_peft_config.save_pretrained(save_directory)
+                    if len(active_adapter) > 1:
+                        raise ValueError(
+                            "Multiple active adapters detected, saving multiple active adapters is not supported yet. You can save adapters separately one by one "
+                            "by iteratively calling `model.set_adapter(adapter_name)` then `model.save_pretrained(...)`"
+                        )
+                    active_adapter = active_adapter[0]
 
-        # FSDP2 models: use DCP distributed save + consolidation for safetensors.
-        # All ranks must call this collectively. Config/generation_config are
-        # already saved above (guarded by is_main_process).
-        if getattr(self, "_is_fsdp_managed_module", False):
-            from .integrations.fsdp import save_fsdp_model
+                    current_peft_config = self.peft_config[active_adapter]
+                    current_peft_config.save_pretrained(save_directory)
+        finally:
+            if distributed_config is not None:
+                model_to_save.config.distributed_config = distributed_config
 
-            save_fsdp_model(model_to_save, save_directory)
-
-            if push_to_hub:
-                model_card = create_and_tag_model_card(repo_id, self.model_tags, token=token)
-                model_card.save(os.path.join(save_directory, "README.md"))
-                self._upload_modified_files(
-                    save_directory,
-                    repo_id,
-                    files_timestamps,
-                    commit_message=commit_message,
-                    token=token,
-                    create_pr=create_pr,
-                )
-            return
-
-        # Get the model state_dict
+        # Get the model state_dict (handles FSDP unshard + TP gather in one call)
         if state_dict is None:
-            state_dict = model_to_save.state_dict()
+            if getattr(self, "device_mesh", None) is not None:
+                # Pass self (not model_to_save) so device_mesh/tp_size/tp_plan are available
+                state_dict = gather_full_state_dict(self)
+            else:
+                state_dict = model_to_save.state_dict()
 
         # if any model parameters are offloaded, we need to know it for later
         is_offloaded = False
@@ -3352,10 +3346,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             for ignore_key in self._keys_to_ignore_on_save:
                 if ignore_key in state_dict:
                     del state_dict[ignore_key]
-
-        # If model was sharded with TP, gather full tensors for saving
-        if self.tp_size is not None:
-            state_dict = gather_state_dict_for_save(state_dict, self._tp_plan, self.device_mesh, self.tp_size)
 
         # Remove tied weights as safetensors do not handle them
         state_dict = remove_tied_weights_from_state_dict(state_dict, model_to_save)
