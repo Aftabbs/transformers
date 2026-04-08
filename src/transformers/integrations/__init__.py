@@ -160,11 +160,7 @@ else:
         "convert_and_export_with_cache",
     ]
 
-_import_structure["tensor_parallel"] = [
-    "shard_and_distribute_module",
-    "ALL_PARALLEL_STYLES",
-    "translate_to_torch_parallel_style",
-]
+_import_structure["tensor_parallel"] = []
 try:
     if not is_torch_greater_or_equal("2.5"):
         raise OptionalDependencyNotAvailable()
@@ -305,10 +301,8 @@ if TYPE_CHECKING:
     else:
         from .executorch import TorchExportableModuleWithStaticCache, convert_and_export_with_cache
 
-    from .tensor_parallel import (
-        ALL_PARALLEL_STYLES,
-        shard_and_distribute_module,
-        translate_to_torch_parallel_style,
+    from .tensor_parallel import (  # noqa: F401
+        gather_state_dict_for_save,
     )
 
     try:

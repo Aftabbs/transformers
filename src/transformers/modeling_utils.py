@@ -75,11 +75,9 @@ from .integrations.peft import maybe_load_adapters
 from .integrations.sdpa_attention import sdpa_attention_forward
 from .integrations.sdpa_paged import sdpa_attention_paged_forward
 from .integrations.tensor_parallel import (
-    ALL_PARALLEL_STYLES,
     _get_parameter_tp_plan,
     apply_tensor_parallel,
     gather_state_dict_for_save,
-    shard_and_distribute_module,
     verify_tp_plan,
 )
 from .loss.loss_utils import LOSS_MAPPING
@@ -1348,14 +1346,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             return
         if not isinstance(plan, dict):
             raise ValueError("Can only set a dictionary as `tp_plan`")
-
-        # Ensure the styles are all valid
-        for layer_pattern, parallel_style in plan.items():
-            if parallel_style not in ALL_PARALLEL_STYLES:
-                raise ValueError(
-                    f"Unsupported tensor parallel style '{parallel_style}' for layer '{layer_pattern}'. "
-                    f"Supported styles are {list(ALL_PARALLEL_STYLES.keys())}"
-                )
 
         # Validate that the layer patterns match existing model structure. We check this by getting all parameter
         # names and seeing if any match the patterns
@@ -3365,7 +3355,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # If model was sharded with TP, gather full tensors for saving
         if self.tp_size is not None:
-            state_dict = gather_state_dict_for_save(state_dict, self._tp_plan, self._device_mesh, self.tp_size)
+            state_dict = gather_state_dict_for_save(state_dict, self._tp_plan, self.device_mesh, self.tp_size)
 
         # Remove tied weights as safetensors do not handle them
         state_dict = remove_tied_weights_from_state_dict(state_dict, model_to_save)
@@ -4569,18 +4559,25 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         # will be re-initialized for nothing (which can be quite long)
         for key in missing_keys - self.all_tied_weights_keys.keys():
             param = self.get_parameter_or_buffer(key)
-            param_device = get_device(device_map, key, valid_torch_device=True)
-            value = torch.empty_like(param, device=param_device)
-            # For TP, we may need to shard the param
-            if device_mesh is not None:
-                tp_mesh = (
-                    device_mesh["tp"]
-                    if device_mesh.ndim > 1 and "tp" in (device_mesh.mesh_dim_names or ())
-                    else device_mesh
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(param, DTensor):
+                # DTensor from parallelize_module on meta — materialize on actual device
+                local_value = torch.empty(
+                    param._local_tensor.shape,
+                    dtype=param.dtype,
+                    device=torch.device(param.device_mesh.device_type, torch.cuda.current_device()),
                 )
-                shard_and_distribute_module(self, value, param, key, None, False, tp_mesh.get_local_rank(), tp_mesh)
-            # Otherwise, just move it to device
+                new_dtensor = DTensor.from_local(
+                    local_value, param.device_mesh, param.placements,
+                    run_check=False, shape=param.shape, stride=tuple(param.stride()),
+                )
+                with torch.no_grad():
+                    new_param = torch.nn.Parameter(new_dtensor, requires_grad=param.requires_grad)
+                    torch.utils.swap_tensors(param, new_param)
             else:
+                param_device = get_device(device_map, key, valid_torch_device=True)
+                value = torch.empty_like(param, device=param_device)
                 _load_parameter_into_model(self, key, value)
         # We need to move back non-persistent buffers as well, as they are not part of loaded weights anyway
         for key, buffer in self.named_non_persistent_buffers():

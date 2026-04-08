@@ -19,9 +19,11 @@ declare -a JOBS=(
     "single_gpu 1"
     "fsdp 2"
     "tp 2"
+    "tp_sp 2"
     "tp_fsdp 4"
+    "tp_sp_fsdp 4"
 )
-MODE_NAMES=(single_gpu fsdp tp tp_fsdp)
+MODE_NAMES=(single_gpu fsdp tp tp_sp tp_fsdp tp_sp_fsdp)
 
 echo -e "${BOLD}=========================================="
 echo -e "  Verify Loading (${NUM_GPUS} GPUs available)"
@@ -96,18 +98,52 @@ done
 echo ""
 echo -e "${BOLD}=== Results ===${NC}"
 for mode in "${MODE_NAMES[@]}"; do
-    loss=$(grep -oP 'loss = \K[0-9.]+' "$LOGDIR/$mode.log" 2>/dev/null)
-    if [ -n "$loss" ]; then
-        printf "  ${GREEN}%-12s loss = %s${NC}\n" "$mode" "$loss"
+    log="$LOGDIR/$mode.log"
+    loss_before=$(grep -oP 'loss_before = \K[0-9.]+' "$log" 2>/dev/null)
+    loss_after=$(grep -oP 'loss_after  = \K[0-9.]+' "$log" 2>/dev/null)
+    if grep -q '^PASS' "$log" 2>/dev/null; then
+        printf "  ${GREEN}%-12s PASS  (before=%-10s after=%s)${NC}\n" "$mode" "$loss_before" "$loss_after"
+    elif [ -n "$loss_before" ]; then
+        diff=$(grep -oP 'diff = \K[0-9.e+-]+' "$log" 2>/dev/null)
+        printf "  ${RED}%-12s FAIL  (before=%-10s after=%-10s diff=%s)${NC}\n" "$mode" "$loss_before" "$loss_after" "$diff"
     else
-        printf "  ${RED}%-12s FAILED${NC}\n" "$mode"
+        printf "  ${RED}%-12s ERROR (see log)${NC}\n" "$mode"
     fi
 done
+
+# ============================================================
+# Cross-mode loss comparison
+# ============================================================
+echo ""
+echo -e "${BOLD}=== Cross-mode loss comparison ===${NC}"
+REF_LOSS=""
+ALL_MATCH=1
+for mode in "${MODE_NAMES[@]}"; do
+    log="$LOGDIR/$mode.log"
+    loss=$(grep -oP 'loss_before = \K[0-9.]+' "$log" 2>/dev/null)
+    if [ -z "$loss" ]; then
+        printf "  ${RED}%-12s  —${NC}\n" "$mode"
+        ALL_MATCH=0
+        continue
+    fi
+    if [ -z "$REF_LOSS" ]; then
+        REF_LOSS="$loss"
+        printf "  ${GREEN}%-12s %s (reference)${NC}\n" "$mode" "$loss"
+    elif [ "$loss" = "$REF_LOSS" ]; then
+        printf "  ${GREEN}%-12s %s${NC}\n" "$mode" "$loss"
+    else
+        printf "  ${YELLOW}%-12s %s (differs from %s)${NC}\n" "$mode" "$loss" "$REF_LOSS"
+        ALL_MATCH=0
+    fi
+done
+if [ "$ALL_MATCH" -eq 1 ] && [ -n "$REF_LOSS" ]; then
+    echo -e "  ${GREEN}All modes produce the same loss.${NC}"
+fi
 
 # Hints for failures
 HAS_FAIL=0
 for mode in "${MODE_NAMES[@]}"; do
-    if ! grep -q 'loss =' "$LOGDIR/$mode.log" 2>/dev/null; then
+    if ! grep -q '^PASS' "$LOGDIR/$mode.log" 2>/dev/null; then
         HAS_FAIL=1
     fi
 done
@@ -115,7 +151,7 @@ if [ "$HAS_FAIL" -eq 1 ]; then
     echo ""
     echo -e "${YELLOW}Some modes failed. Check logs:${NC}"
     for mode in "${MODE_NAMES[@]}"; do
-        if ! grep -q 'loss =' "$LOGDIR/$mode.log" 2>/dev/null; then
+        if ! grep -q '^PASS' "$LOGDIR/$mode.log" 2>/dev/null; then
             echo -e "  ${YELLOW}cat $LOGDIR/$mode.log${NC}"
         fi
     done

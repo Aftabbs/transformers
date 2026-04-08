@@ -65,7 +65,7 @@ class MixtralConfig(PreTrainedConfig):
         "layers.*.self_attn.o_proj":          TPStyle("rowwise", "reduce_scatter"),
         "layers.*.post_attention_layernorm":  TPStyle("activation", "none"),
         "layers.*.mlp":                       TPStyle("module", "allgather_split"),
-        "layers.*.mlp.experts.gate_up_proj":  "packed_colwise",
+        "layers.*.mlp.experts.gate_up_proj":  "packed_colwise", #TODO(3Outeille): check how it is dispatch
         "layers.*.mlp.experts.down_proj":     "rowwise",
         "layers.*.mlp.experts":               TPStyle("moe_experts", "allreduce"),
         "norm":                               TPStyle("activation", "none"),
