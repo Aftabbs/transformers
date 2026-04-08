@@ -11,7 +11,6 @@ from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.distributed import DistributedConfig
-from torchtitan.distributed import utils as dist_utils #TODO(3outeille): add this to transformers.distributed
 
 def build_packed_dataset(dataset_name, tokenizer, seq_len, dp_rank, dp_world_size):
     """Stream + tokenize + greedy-pack documents into fixed-length (input, label) windows."""
@@ -113,12 +112,16 @@ if __name__ == "__main__":
             )
             loss.backward()
 
-        grad_norm = dist_utils.clip_grad_norm_(list(model.parameters()), max_norm=1.0, foreach=True)
+        # Custom grad clip: convert DTensor grads to local to avoid mixed-mesh torch.stack
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        local_grads = [g.full_tensor() if isinstance(g, DTensor) else g for g in grads]
+        total_norm = torch.nn.utils.get_total_norm(local_grads, norm_type=2.0)
+        torch.nn.utils.clip_grads_with_norm_(grads, max_norm=1.0, total_norm=total_norm)
         optimizer.step()
         optimizer.zero_grad()
 
         if rank == 0:
-            print(f"Step {step:>4d} | Loss: {loss.item():.4f} | Grad norm: {grad_norm.item():.4f}")
+            print(f"Step {step:>4d} | Loss: {loss.item():.4f} | Grad norm: {total_norm.item():.4f}")
 
     # Save model (HF format) and optimizer (DCP)
     model.save_pretrained(args.save_dir)

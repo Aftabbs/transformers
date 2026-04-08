@@ -1189,7 +1189,7 @@ ALL_PARALLEL_STYLES = GeneralInterface()
 from dataclasses import dataclass
 from typing import Literal
 
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     PrepareModuleInput,
@@ -1200,10 +1200,138 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.parallel.style import ParallelStyle
 
 
+class PrepareModuleInputOutput(ParallelStyle):
+    """Allgather input (Shard(1) → Replicate) + local split output (Replicate → Shard(1)).
+
+    Used for MoE blocks with SP: the input sequence is gathered before routing,
+    and the output (after expert allreduce) is split back to match the residual.
+    Forward output split is a local op (no comm). Backward creates the all-gather.
+    """
+
+    def __init__(self, use_local_output=True):
+        super().__init__()
+        self.use_local_output = use_local_output
+
+    def _apply(self, module, device_mesh):
+        def input_hook(mod, inputs):
+            x = inputs[0] if isinstance(inputs, tuple) else inputs
+            if not isinstance(x, DTensor):
+                x = DTensor.from_local(x, device_mesh, [Shard(1)], run_check=False)
+            x = x.redistribute(placements=[Replicate()])
+            x = x.to_local()
+            return (x,) + (inputs[1:] if isinstance(inputs, tuple) else ())
+
+        def output_hook(mod, inputs, output):
+            if not isinstance(output, DTensor):
+                output = DTensor.from_local(output, device_mesh, [Replicate()], run_check=False)
+            output = output.redistribute(placements=[Shard(1)])
+            return output.to_local()
+
+        module.register_forward_pre_hook(input_hook)
+        module.register_forward_hook(output_hook)
+        return module
+
+
+class MoEShardOperation:
+    """Shards MoE expert weights during loading.
+
+    Same ``shard_tensor`` interface as ``DtensorShardOperation`` so it plugs
+    into ``ParallelMaterializationContext`` / ``spawn_parallel_materialize``.
+
+    - Non-packed weights (down_proj): sharded on read via ``get_tensor_shard``
+    - Packed weights (gate_up_proj): returned full — ``set_param_for_module``
+      shards after the ``WeightConverter`` merges + concatenates.
+    """
+
+    def __init__(self, device_mesh, param_name, empty_param):
+        self.device_mesh = device_mesh
+        self.rank = device_mesh.get_local_rank()
+        self.param_name = param_name
+        self.empty_param = empty_param
+
+    def shard_tensor(self, param, tensor_idx=None, device=None, dtype=None):
+        # Shard each individual expert tensor on read (before merge/concatenation).
+        # Individual w1/w3 are NOT packed — packing happens after in the WeightConverter.
+        param_shape = list(param.shape) if isinstance(param, torch.Tensor) else param.get_shape()
+        world_size = self.device_mesh.size()
+
+        if "gate" in self.param_name or "up" in self.param_name:
+            dim = 0  # colwise: shard output features (dim 0 of 2D individual expert)
+        else:
+            dim = len(param_shape) - 1  # rowwise: shard input features (last dim)
+
+        shard_size = math.ceil(param_shape[dim] / world_size)
+        start = self.rank * shard_size
+        end = min(start + shard_size, param_shape[dim])
+
+        slices = [slice(None)] * len(param_shape)
+        slices[dim] = slice(start, end)
+        return param[tuple(slices)].to(device=device, dtype=dtype)
+
+
+class MoEExpertsParallel(ParallelStyle):
+    """Hybrid parallel style for MoE expert modules.
+
+    Weights are plain tensors, sharded during loading via ``MoEShardOperation``.
+    Communication uses DTensor ``from_local``/``to_local`` on activations only —
+    compatible with ``grouped_mm``.
+    """
+
+    def __init__(self, output_layouts=None):
+        super().__init__()
+        self.output_layouts = output_layouts or Replicate()
+
+    @staticmethod
+    def _partition_fn(name, module, device_mesh):
+        # Mark module and params for MoE sharding during loading.
+        # No DTensor distribution — weights stay as plain Parameters.
+        module._moe_tp_mesh = device_mesh
+        for param_name, param in module.named_parameters(recurse=False):
+            param._moe_shard_info = {"mesh": device_mesh, "param_name": param_name}
+
+    @staticmethod
+    def _prepare_input_fn(mod, inputs, device_mesh):
+        hidden_states, top_k_index, top_k_weights = inputs[0], inputs[1], inputs[2]
+        # from_local([Replicate()]).to_local(): forward sees plain tensor,
+        # backward graph goes through DTensor all-reduce on gradient.
+        if not isinstance(hidden_states, DTensor):
+            hidden_states = DTensor.from_local(hidden_states, device_mesh, [Replicate()], run_check=False)
+        hidden_states = hidden_states.to_local()
+        if not isinstance(top_k_weights, DTensor):
+            top_k_weights = DTensor.from_local(top_k_weights, device_mesh, [Replicate()], run_check=False)
+        top_k_weights = top_k_weights.to_local()
+        return (hidden_states, top_k_index, top_k_weights)
+
+    @staticmethod
+    def _prepare_output_fn(output_layouts, mod, outputs, device_mesh):
+        # from_local([Partial()]) → redistribute → to_local()
+        if not isinstance(outputs, DTensor):
+            outputs = DTensor.from_local(outputs, device_mesh, [Partial()], run_check=False)
+        # MoE experts output 2D [num_tokens, hidden]. For SP reduce-scatter,
+        # Shard(1) means sequence dim in 3D, but in 2D the token dim is 0.
+        actual_layouts = output_layouts
+        if outputs.dim() == 2 and isinstance(output_layouts, Shard) and output_layouts.dim == 1:
+            actual_layouts = Shard(0)
+        if outputs.placements != (actual_layouts,):
+            outputs = outputs.redistribute(placements=(actual_layouts,))
+        return outputs.to_local()
+
+    def _apply(self, module, device_mesh):
+        # Don't use PyTorch's distribute_module — it auto-converts all params
+        # to Replicate DTensors, which breaks shard-on-read for MoE weights.
+        # Register hooks manually instead.
+        self._partition_fn(module.__class__.__name__, module, device_mesh)
+        module.register_forward_pre_hook(lambda mod, inputs: self._prepare_input_fn(mod, inputs, device_mesh))
+        module.register_forward_hook(
+            lambda mod, inputs, outputs: self._prepare_output_fn(self.output_layouts, mod, outputs, device_mesh)
+        )
+        return module
+
+
 @dataclass(frozen=True)
 class TPStyle:
-    kind: Literal["colwise", "rowwise", "vocab", "activation", "module"]
-    comm: Literal["none", "allreduce", "reduce_scatter", "allgather", "loss_parallel"]
+    kind: Literal["colwise", "rowwise", "vocab", "activation", "module", "moe_experts"]
+    comm: Literal["none", "allreduce", "reduce_scatter", "allgather", "allgather_split", "loss_parallel"]
     sequence_dim: int = 1
     use_local_output: bool = True
     input_key: str | None = None
@@ -1233,18 +1361,27 @@ class TPStyle:
                         return PrepareModuleInput(
                             input_kwarg_layouts={self.input_key: Shard(1)},
                             desired_input_kwarg_layouts={self.input_key: Replicate()},
+                            use_local_output=self.use_local_output,
                         )
                     return PrepareModuleInput(
                         input_layouts=(Shard(1),),
                         desired_input_layouts=(Replicate(),),
+                        use_local_output=self.use_local_output,
                     )
+                case "allgather_split":
+                    return PrepareModuleInputOutput(use_local_output=self.use_local_output)
+        elif self.kind == "moe_experts":
+            match self.comm:
+                case "allreduce":      return MoEExpertsParallel(output_layouts=Replicate())
+                case "reduce_scatter": return MoEExpertsParallel(output_layouts=Shard(1))
         raise ValueError(
             f"Invalid TPStyle({self.kind!r}, {self.comm!r}). Valid combinations:\n"
-            f"  colwise:    none, allgather, loss_parallel\n"
-            f"  rowwise:    allreduce, reduce_scatter\n"
-            f"  vocab:      allreduce, reduce_scatter\n"
-            f"  activation: none\n"
-            f"  module:     allgather"
+            f"  colwise:     none, allgather, loss_parallel\n"
+            f"  rowwise:     allreduce, reduce_scatter\n"
+            f"  vocab:       allreduce, reduce_scatter\n"
+            f"  activation:  none\n"
+            f"  module:      allgather, allgather_split\n"
+            f"  moe_experts: allreduce, reduce_scatter"
         )
 
     def __str__(self):
@@ -1284,7 +1421,16 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
         if style_value is None:
             continue
 
-        parallelize_plan[name] = style_value.to_dtensor_style()
+        if isinstance(style_value, TPStyle):
+            parallelize_plan[name] = style_value.to_dtensor_style()
+        elif isinstance(style_value, str):
+            tp_style = ALL_PARALLEL_STYLES.get(style_value)
+            if tp_style is None:
+                logger.warning_once(f"TP style '{style_value}' for module '{name}' not found.")
+                continue
+            parallelize_plan[name] = tp_style
+        else:
+            parallelize_plan[name] = style_value
 
     parallelize_module(model, tp_mesh, parallelize_plan)
 

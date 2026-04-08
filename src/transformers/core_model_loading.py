@@ -1079,21 +1079,47 @@ def get_parallel_materialization_context(
     empty_param,
     device_mesh,
     device_map,
+    model=None,
+    tp_plan=None,
 ) -> ParallelMaterializationContext | None:
     """Return the parallel context needed to shard a tensor on read, or None if not applicable."""
-    if not isinstance(empty_param, DTensor):
-        return None
-
     tensor_idx = (
         len(mapping.collected_tensors.get(source_pattern, []))
         if isinstance(mapping, WeightConverter) and isinstance(mapping.operations[0], MergeModulelist)
         else None
     )
-    return ParallelMaterializationContext(
-        distributed_operation=DtensorShardOperation(empty_param),
-        tensor_idx=tensor_idx,
-        device=get_device(device_map, renamed_key, valid_torch_device=True),
-    )
+
+    if isinstance(empty_param, DTensor):
+        return ParallelMaterializationContext(
+            distributed_operation=DtensorShardOperation(empty_param),
+            tensor_idx=tensor_idx,
+            device=get_device(device_map, renamed_key, valid_torch_device=True),
+        )
+
+    # MoE expert weights: look up the tp_plan for string-based shard styles
+    # (e.g. "packed_colwise", "rowwise") that tell us how to shard on read.
+    # Try both the full key and without the base model prefix since the
+    # tp_plan from config uses unprefixed keys.
+    if tp_plan is not None and device_mesh is not None:
+        from .integrations.tensor_parallel import _get_parameter_tp_plan
+
+        shard_style = _get_parameter_tp_plan(renamed_key, tp_plan)
+        if shard_style is None and model is not None:
+            prefix = getattr(model, "base_model_prefix", "")
+            if prefix and renamed_key.startswith(prefix + "."):
+                shard_style = _get_parameter_tp_plan(renamed_key[len(prefix) + 1 :], tp_plan)
+
+        if isinstance(shard_style, str):
+            from .integrations.tensor_parallel import MoEShardOperation
+
+            param_name = renamed_key.rsplit(".", 1)[1] if "." in renamed_key else renamed_key
+            return ParallelMaterializationContext(
+                distributed_operation=MoEShardOperation(device_mesh, param_name, empty_param),
+                tensor_idx=tensor_idx,
+                device=get_device(device_map, renamed_key, valid_torch_device=True),
+            )
+
+    return None
 
 
 def dot_natural_key(s: str):
@@ -1186,10 +1212,21 @@ def set_param_for_module(
         loading_info.missing_keys.discard(target_name)
 
         if isinstance(ref, DTensor):
-            local_shape, _ = compute_local_shape_and_global_offset(ref.shape, ref.device_mesh, ref.placements)
+            local_shape, global_offset = compute_local_shape_and_global_offset(ref.shape, ref.device_mesh, ref.placements)
             expected_shape = torch.Size(local_shape)
+        elif hasattr(module_obj, "_moe_tp_mesh"):
+            # MoE expert weights are sharded on read by MoEShardOperation.
+            # The model param is full-size but the loaded tensor is sharded — accept it.
+            expected_shape = param_value.shape
         else:
             expected_shape = ref.shape
+
+        # When a WeightConverter produces the full global tensor, slice it to the local DTensor shard.
+        if isinstance(ref, DTensor) and param_value.shape == ref.shape and param_value.shape != expected_shape:
+            slices = [
+                slice(global_offset[d], global_offset[d] + local_shape[d]) for d in range(param_value.ndim)
+            ]
+            param_value = param_value[tuple(slices)].contiguous()
 
         if ref is not None and param_value.shape != expected_shape and hf_quantizer is None:
             loading_info.mismatched_keys.add((target_name, param_value.shape, expected_shape))
@@ -1400,10 +1437,16 @@ def convert_and_load_state_dict_in_model(
     """
     prefix = model.base_model_prefix
     tp_plan = tp_plan or {}
-    device_map = load_config.device_map or {"": "cpu"}
     hf_quantizer = load_config.hf_quantizer
     dtype = load_config.dtype
     device_mesh = load_config.device_mesh
+
+    if load_config.device_map is not None:
+        device_map = load_config.device_map
+    elif device_mesh is not None:
+        device_map = {"": torch.device(device_mesh.device_type, torch.cuda.current_device())}
+    else:
+        device_map = {"": "cpu"}
     disk_offload_folder = load_config.disk_offload_folder
     offload_buffers = load_config.offload_buffers
     dtype_plan = load_config.dtype_plan or {}
@@ -1522,6 +1565,8 @@ def convert_and_load_state_dict_in_model(
                 empty_param=empty_param,
                 device_mesh=device_mesh,
                 device_map=device_map,
+                model=model,
+                tp_plan=tp_plan,
             ):
                 future_or_tensor = spawn_parallel_materialize(
                     thread_pool,
