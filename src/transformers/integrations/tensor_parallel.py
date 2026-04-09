@@ -256,79 +256,72 @@ def repack_weights(
 # =============================================================================
 
 
-def gather_full_tensor(
-    local_tensor: torch.Tensor, shard_dim: int, device_mesh: dist.device_mesh.DeviceMesh
-) -> torch.Tensor:
-    """
-    All-gather a sharded tensor along the specified dimension to reconstruct the full tensor.
-
-    Args:
-        local_tensor: The local shard of the tensor on this rank
-        shard_dim: The dimension along which the tensor was sharded
-        device_mesh: The device mesh for distributed communication
-
-    Returns:
-        The full reconstructed tensor (same on all ranks)
-    """
-    world_size = device_mesh.size()
-    # In case of TP+DP configuration, the TP group should be used for gathering, not the full DP group
-    process_group = device_mesh.get_group("tp") if "tp" in (device_mesh.mesh_dim_names or {}) else None
-
-    # Normalize negative dimension
-    if shard_dim < 0:
-        shard_dim = local_tensor.ndim + shard_dim
-
-    # Gather all shards
-    gathered_tensors = [torch.empty_like(local_tensor) for _ in range(world_size)]
-    dist.all_gather(gathered_tensors, local_tensor.contiguous(), group=process_group)
-
-    # Concatenate along the shard dimension
-    return torch.cat(gathered_tensors, dim=shard_dim)
-
-
-def _materialize_tensor_for_save(tensor: torch.Tensor) -> torch.Tensor:
-    """Return a plain CPU tensor with fresh storage for safetensors serialization."""
-    if isinstance(tensor, DTensor):
-        # ``to_local`` returns the raw local tensor under ``no_grad``, which avoids
-        # leaving autograd/DTensor wrapper metadata attached to the gathered result.
-        with torch.no_grad():
-            tensor = tensor.redistribute(placements=[Replicate()] * tensor.device_mesh.ndim, async_op=False).to_local()
-
+def _to_cpu_fresh(tensor: torch.Tensor) -> torch.Tensor:
+    """Plain tensor → contiguous CPU tensor with fresh storage for safetensors."""
     if tensor.device.type == "meta":
         return tensor
+    t = tensor.detach()
+    if t.device.type != "cpu":
+        t = t.to(device="cpu")
+    out = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+    out.copy_(t)
+    return out.contiguous()
 
-    if _torch_distributed_available:
-        try:
-            from torch.distributed._functional_collectives import AsyncCollectiveTensor
-        except ImportError:
-            AsyncCollectiveTensor = ()
 
-        if isinstance(tensor, AsyncCollectiveTensor):
-            tensor = tensor.wait()
+# Maps string tp_plan entries (MoE experts) to their weight shard dimension.
+_STRING_PLAN_TO_SHARD_DIM = {
+    "packed_colwise": -2,
+    "rowwise": -1,
+}
 
-    cpu_tensor = tensor.detach()
-    if cpu_tensor.device.type != "cpu":
-        cpu_tensor = cpu_tensor.to(device="cpu")
 
-    # Explicit copy avoids carrying DTensor/FSDP wrapper storage into safetensors.
-    materialized_tensor = torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device="cpu")
-    materialized_tensor.copy_(cpu_tensor)
-    return materialized_tensor.contiguous()
+def _gather_full_param(tensor, shard_dim: int | None, tp_mesh, tp_size: int, is_packed: bool) -> torch.Tensor:
+    """Gather a single sharded parameter (DTensor or plain MoE tensor) into a full tensor.
+
+    - DTensor: ``redistribute([Replicate()])`` (collective across the DTensor's mesh).
+    - Plain tensor with a ``shard_dim``: ``all_gather`` on the TP process group.
+
+    If ``is_packed``, repacks interleaved gate/up shards back to canonical layout.
+    """
+    if isinstance(tensor, DTensor):
+        with torch.no_grad():
+            full = tensor.redistribute(placements=[Replicate()] * tensor.device_mesh.ndim, async_op=False).to_local()
+
+        # Only repack if the DTensor was actually sharded along the packed axis
+        if is_packed and shard_dim is not None:
+            for p in tensor.placements:
+                if not p.is_replicate() and hasattr(p, "dim") and p.dim == shard_dim:
+                    full = repack_weights(full, shard_dim, tp_size, 2)
+                    break
+    else:
+        # Plain MoE tensor — manual all_gather
+        world_size = tp_mesh.size()
+        process_group = tp_mesh.get_group("tp") if "tp" in (tp_mesh.mesh_dim_names or {}) else None
+        norm_dim = shard_dim + tensor.ndim if shard_dim < 0 else shard_dim
+        gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor.contiguous(), group=process_group)
+        full = torch.cat(gathered, dim=norm_dim)
+        if is_packed:
+            full = repack_weights(full, shard_dim, tp_size, 2)
+
+    return full
 
 
 def gather_full_state_dict(model) -> dict[str, torch.Tensor]:
     """Gather all sharded params to full plain tensors for saving.
 
-    Handles FSDP unshard, TP DTensor gather, and MoE plain tensor gather
-    in one unified function. Returns a state dict of plain, full, contiguous tensors.
+    Handles FSDP unshard, TP DTensor gather, and MoE plain tensor gather.
+    Streams one parameter at a time to avoid holding all full tensors on GPU.
+    Only rank 0 accumulates the result; other ranks return ``{}``.
     """
-    from torch.distributed.tensor import DTensor
-
     tp_plan = getattr(model, "_tp_plan", {}) or {}
-    device_mesh = getattr(model, "device_mesh", None)
-    base_prefix = getattr(model, "base_model_prefix", "")
+    device_mesh = model.device_mesh
+    base_prefix = model.base_model_prefix
+    tp_size = model.tp_size
+    tp_mesh = device_mesh["tp"] if device_mesh.ndim > 1 else device_mesh
+    is_rank0 = dist.get_rank() == 0
 
-    # Step 1: Get state dict — FSDP unshard if needed
+    # Get state dict — FSDP unshard if needed (returns DTensors, not full tensors)
     if getattr(model, "_is_fsdp_managed_module", False):
         from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
@@ -336,74 +329,44 @@ def gather_full_state_dict(model) -> dict[str, torch.Tensor]:
     else:
         state_dict = model.state_dict()
 
-    tp_mesh = (
-        device_mesh["tp"]
-        if device_mesh is not None and device_mesh.ndim > 1 and "tp" in (device_mesh.mesh_dim_names or ())
-        else device_mesh
-    )
-    tp_size = getattr(model, "tp_size", None)
-    if tp_size is None and tp_mesh is not None and len(tp_plan) > 0:
-        tp_size = tp_mesh.size()
+    # No TP — materialize on rank 0 only
     if tp_size is None:
-        return {k: _materialize_tensor_for_save(v) if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
+        if is_rank0:
+            return {k: _to_cpu_fresh(v) for k, v in state_dict.items()}
+        return {}
 
-    # Shard dim for MoE expert plain tensors (string plan entries)
-    _string_plan_to_weight_dim = {
-        "packed_colwise": -2,  # second-to-last dim (dim 1 for 3D, dim 0 for 2D)
-        "rowwise": -1,
-    }
-
-    def _lookup_plan(key):
-        """Look up the tp_plan for a key, trying with and without base model prefix."""
+    #NOTE(3outeille): This for MoE plain tensors
+    def lookup_plan(key):
         plan = _get_parameter_tp_plan(key, tp_plan)
         if plan is None and base_prefix and key.startswith(base_prefix + "."):
             plan = _get_parameter_tp_plan(key[len(base_prefix) + 1 :], tp_plan)
         return plan
 
-    # Step 2: Gather any remaining TP-sharded tensors
-    # All tensors are cloned + contiguous to ensure valid storage for safetensors
+    # Stream: gather one param at a time, only rank 0 keeps the CPU copy
     result = {}
     for key, tensor in state_dict.items():
-        current_plan = _lookup_plan(key)
+        current_plan = lookup_plan(key)
 
-        # Normalize the weight shard dim encoded by string plans so we only repack
-        # packed tensors when the DTensor is actually sharded along the packed axis.
-        plan_shard_dim = None
-        if isinstance(current_plan, str) and current_plan in _string_plan_to_weight_dim:
-            plan_shard_dim = _string_plan_to_weight_dim[current_plan]
-            if plan_shard_dim < 0:
-                plan_shard_dim += len(tensor.shape)
+        # Resolve shard dim for string plan entries (MoE experts)
+        shard_dim = None
+        if isinstance(current_plan, str) and current_plan in _STRING_PLAN_TO_SHARD_DIM:
+            shard_dim = _STRING_PLAN_TO_SHARD_DIM[current_plan]
+            if shard_dim < 0:
+                shard_dim += len(tensor.shape)
 
-        # DTensor: .full_tensor() (may be no-op if already gathered by get_model_state_dict)
-        if isinstance(tensor, DTensor):
-            with torch.no_grad():
-                full_tensor = tensor.redistribute(
-                    placements=[Replicate()] * tensor.device_mesh.ndim, async_op=False
-                ).to_local()
-            if isinstance(current_plan, str) and "packed" in current_plan and plan_shard_dim is not None:
-                for p in tensor.placements:
-                    if not p.is_replicate() and hasattr(p, "dim") and p.dim == plan_shard_dim:
-                        full_tensor = repack_weights(full_tensor, plan_shard_dim, tp_size, 2)
-                        break
-            result[key] = _materialize_tensor_for_save(full_tensor)
+        is_sharded = isinstance(tensor, DTensor) or (tp_mesh is not None and shard_dim is not None)
+        is_packed = isinstance(current_plan, str) and "packed" in current_plan
 
-        # MoE plain tensor: gather on TP sub-mesh
-        elif tp_mesh is not None:
-            if plan_shard_dim is not None:
-                shard_dim = _string_plan_to_weight_dim[current_plan]
-                full_tensor = gather_full_tensor(tensor, shard_dim, tp_mesh)
-                if "packed" in current_plan:
-                    full_tensor = repack_weights(full_tensor, shard_dim, tp_size, 2)
-                result[key] = _materialize_tensor_for_save(full_tensor)
-            else:
-                result[key] = _materialize_tensor_for_save(tensor)
-
-        else:
-            result[key] = _materialize_tensor_for_save(tensor)
+        if is_sharded:
+            # All ranks participate in the collective, only rank 0 keeps the result
+            full = _gather_full_param(tensor, shard_dim, tp_mesh, tp_size, is_packed)
+            if is_rank0:
+                result[key] = _to_cpu_fresh(full)
+            del full
+        elif is_rank0:
+            result[key] = _to_cpu_fresh(tensor)
 
     return result
-
-
 
 
 def verify_tp_plan(expected_keys: list[str], tp_plan: dict[str, str | TPStyle] | None):
@@ -542,6 +505,32 @@ class MoEExpertsParallel(ParallelStyle):
             param._moe_shard_info = {"mesh": device_mesh, "param_name": param_name}
 
     @staticmethod
+    def _uses_partial_outputs(mod) -> bool:
+        cached = getattr(mod, "_moe_outputs_are_partial", None)
+        if cached is not None:
+            return cached
+
+        # Under TP-only the expert MLP dimension is sharded, so each rank emits a
+        # partial hidden-state contribution that must be reduced. Under TP+FSDP,
+        # FSDP can swap in full gathered expert weights for the current rank's
+        # forward, in which case the local output is already complete.
+        if hasattr(mod, "gate_up_proj"):
+            gate_up_proj = mod.gate_up_proj.to_local() if isinstance(mod.gate_up_proj, DTensor) else mod.gate_up_proj
+            full_expert_out = 2 * mod.intermediate_dim
+            sharded_dim = -1 if getattr(mod, "is_transposed", False) else -2
+            cached = gate_up_proj.shape[sharded_dim] != full_expert_out
+        elif hasattr(mod, "up_proj"):
+            up_proj = mod.up_proj.to_local() if isinstance(mod.up_proj, DTensor) else mod.up_proj
+            full_expert_out = mod.intermediate_dim
+            sharded_dim = -1 if getattr(mod, "is_transposed", False) else -2
+            cached = up_proj.shape[sharded_dim] != full_expert_out
+        else:
+            cached = True
+
+        mod._moe_outputs_are_partial = cached
+        return cached
+
+    @staticmethod
     def _prepare_input_fn(mod, inputs, device_mesh):
         hidden_states, top_k_index, top_k_weights = inputs[0], inputs[1], inputs[2]
         # from_local([Replicate()]).to_local(): forward sees plain tensor,
@@ -556,9 +545,12 @@ class MoEExpertsParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_output_fn(output_layouts, mod, outputs, device_mesh):
-        # from_local([Partial()]) → redistribute → to_local()
+        # Plain TP expert weights produce partial outputs that need an all-reduce.
+        # TP+FSDP can leave experts replicated across TP and sharded only across
+        # experts/FSDP, in which case the local output is already complete.
+        source_layout = Partial() if MoEExpertsParallel._uses_partial_outputs(mod) else Replicate()
         if not isinstance(outputs, DTensor):
-            outputs = DTensor.from_local(outputs, device_mesh, [Partial()], run_check=False)
+            outputs = DTensor.from_local(outputs, device_mesh, [source_layout], run_check=False)
         # MoE experts output 2D [num_tokens, hidden]. For SP reduce-scatter,
         # Shard(1) means sequence dim in 3D, but in 2D the token dim is 0.
         actual_layouts = output_layouts

@@ -10,28 +10,33 @@
 #   torchrun --nproc_per_node=2 verify_loading.py --mode tp
 #   torchrun --nproc_per_node=4 verify_loading.py --mode tp_fsdp
 #   MODEL=Qwen/Qwen3-0.6B torchrun --nproc_per_node=2 verify_loading.py --mode tp
-import argparse, contextlib, os, tempfile, torch
+import argparse
+import os
+import shutil
+
+import torch
+from torch.distributed.tensor import DTensor, Replicate
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.distributed import DistributedConfig
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", choices=["single_gpu", "fsdp", "tp", "tp_sp", "tp_fsdp", "tp_sp_fsdp"], required=True)
 parser.add_argument("--model", type=str, default=None, help="Model ID (or set MODEL env var)")
 args = parser.parse_args()
 
-model_id = args.model or os.environ.get("MODEL", "hf-internal-testing/tiny-random-MixtralForCausalLM")
+model_id = args.model or os.environ.get("MODEL") or os.environ.get("MODEL_ID") or "hf-internal-testing/tiny-random-MixtralForCausalLM"
 
 if args.mode != "single_gpu":
     torch.distributed.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    world_size = torch.distributed.get_world_size()
 else:
     rank = 0
     local_rank = 0
     torch.cuda.set_device(0)
-    world_size = 1
 
 configs = {
     "single_gpu": None,
@@ -42,16 +47,15 @@ configs = {
     "tp_sp_fsdp": DistributedConfig(tp_size=2, tp_plan="auto", fsdp_size=2, fsdp_plan="auto", enable_sequence_parallel=True),
 }
 
-# TP modes need loss_parallel to handle sharded logits
-use_tp = args.mode in ("tp", "tp_sp", "tp_fsdp", "tp_sp_fsdp")
-if use_tp:
-    from torch.distributed.tensor.parallel import loss_parallel
-    eval_context = loss_parallel
-else:
-    eval_context = contextlib.nullcontext
-
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 text = "The capital of France is Paris. The largest ocean is the Pacific."
+
+
+def materialize_full_logits(logits: torch.Tensor) -> torch.Tensor:
+    if isinstance(logits, DTensor):
+        with torch.no_grad():
+            return logits.redistribute(placements=[Replicate()] * logits.device_mesh.ndim, async_op=False).to_local()
+    return logits
 
 
 def compute_loss(model):
@@ -61,12 +65,14 @@ def compute_loss(model):
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
     model.eval()
-    with torch.no_grad(), eval_context():
+    with torch.no_grad():
         logits = model(input_ids, position_ids=position_ids).logits
+        logits = materialize_full_logits(logits)
         loss = torch.nn.functional.cross_entropy(
             logits.flatten(0, 1).float(),
             labels.flatten(0, 1),
             reduction="mean",
+            ignore_index=-100,
         )
     return loss.item()
 
@@ -80,16 +86,15 @@ loss_before = compute_loss(model)
 if rank == 0:
     print(f"{args.mode}: loss_before = {loss_before:.6f}")
 
-# --- Step 2: Save to temp dir (shared path across ranks) ---
+# --- Step 2: Save to local dir (shared path across ranks) ---
+save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"verify_ckpt_{args.mode}")
 if rank == 0:
-    save_dir = tempfile.mkdtemp(prefix=f"verify_{args.mode}_")
-else:
-    save_dir = None
+    if os.path.exists(save_dir):
+        shutil.rmtree(save_dir)
+    os.makedirs(save_dir)
 if args.mode != "single_gpu":
-    save_dir_list = [save_dir]
-    torch.distributed.broadcast_object_list(save_dir_list, src=0)
-    save_dir = save_dir_list[0]
-model.save_pretrained(save_dir)
+    torch.distributed.barrier()
+model.save_pretrained(save_dir, is_main_process=(rank == 0))
 if rank == 0:
     print(f"{args.mode}: saved to {save_dir}")
 
@@ -114,9 +119,9 @@ if rank == 0:
     diff = abs(loss_before - loss_after)
     print(f"{args.mode}: diff = {diff:.2e}")
     if diff < 1e-5:
-        print(f"PASS: save/load roundtrip is lossless")
+        print("PASS: save/load roundtrip is lossless")
     else:
-        print(f"FAIL: loss mismatch after save/load roundtrip!")
+        print("FAIL: loss mismatch after save/load roundtrip!")
 
 if args.mode != "single_gpu":
     torch.distributed.destroy_process_group()
