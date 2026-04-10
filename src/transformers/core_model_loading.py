@@ -877,8 +877,8 @@ class DtensorShardOperation:
             # When dim 0 is the only sharding placement, return the full expert or
             # skip it. When TP also shards an inner dim, keep applying the remaining
             # placements to the owned expert tensor.
-            expert_placements = [(i, p) for i, p in sharding_placements if self._normalize_param_dim(p.dim) == 0]
-            if expert_placements:
+            has_expert_sharding = any(self._normalize_param_dim(p.dim) == 0 for _, p in sharding_placements)
+            if has_expert_sharding:
                 if not self._owns_local_expert(tensor_idx):
                     return None
                 inner_placements = [(i, p) for i, p in sharding_placements if self._normalize_param_dim(p.dim) != 0]
@@ -887,16 +887,6 @@ class DtensorShardOperation:
                 return self._shard_nd(param, inner_placements, param_shape, device, dtype)
 
         return self._shard_nd(param, sharding_placements, param_shape, device, dtype)
-
-    def _shard_expert(self, param, tensor_idx, device, dtype):
-        """Handle MoE experts that arrive one tensor at a time.
-
-        The DTensor parameter has an extra leading dimension stacking all experts.
-        Skip experts not owned by this rank; return the full expert otherwise.
-        """
-        if not self._owns_local_expert(tensor_idx):
-            return None
-        return param[...].to(device=device, dtype=dtype)
 
     def _shard_nd(self, param, sharding_placements, param_shape, device, dtype):
         """Handle multi-dimensional sharding, choosing the best strategy."""
@@ -912,13 +902,7 @@ class DtensorShardOperation:
             )
             slices = [slice(None)] * len(param_shape)
             for _, placement in sharding_placements:
-                # Adjust dim when DTensor has more dims than checkpoint tensor (e.g. MoE 3D vs 2D)
-                dim = placement.dim
-                if dim < 0:
-                    dim = self.param.ndim + dim
-                ndim_diff = self.param.ndim - len(param_shape)
-                if ndim_diff > 0 and dim >= ndim_diff:
-                    dim -= ndim_diff
+                dim = self._checkpoint_dim(placement.dim, param_shape)
                 offset = global_offset[placement.dim]
                 slices[dim] = slice(offset, offset + local_shape[placement.dim])
             return param[tuple(slices)].to(device=device, dtype=dtype)
@@ -970,18 +954,12 @@ class DtensorShardOperation:
             sub_mesh = self._get_sub_mesh(mesh_dim_idx)
             rank = sub_mesh.get_local_rank()
             world_size = sub_mesh.size()
-            # Adjust dim when DTensor has more dims than checkpoint tensor (e.g. MoE 3D vs 2D)
-            dim = placement.dim
-            if dim < 0:
-                dim = self.param.ndim + dim
-            ndim_diff = self.param.ndim - len(param_shape)
-            if ndim_diff > 0 and dim >= ndim_diff:
-                dim -= ndim_diff
+            dim = self._checkpoint_dim(placement.dim, param_shape)
             prev_ranges = dim_ranges.get(dim, [(0, param_shape[dim])])
 
             if placement.is_shard():
                 new_ranges = self._contiguous_ranges(prev_ranges, rank, world_size)
-            elif self._uses_unpacked_source_tensor(param_shape):
+            elif self._source_tensor_needs_packing(param_shape):
                 # _StridedShard only makes sense once the packed axis exists. While
                 # loading pre-packed source tensors (e.g. w1/w3 before gate_up_proj
                 # concatenation), take the contiguous chunk for this rank and let the
@@ -1005,6 +983,8 @@ class DtensorShardOperation:
             if len(ranges) == 1:
                 base_slices[dim] = slice(ranges[0][0], ranges[0][1])
             elif len(ranges) > 1:
+                if concat_dim is not None:
+                    raise ValueError("Shard-on-read only supports disjoint ranges on a single checkpoint dimension.")
                 concat_dim = dim
                 concat_ranges = ranges
 
@@ -1067,13 +1047,21 @@ class DtensorShardOperation:
     def _normalize_param_dim(self, dim: int) -> int:
         return dim if dim >= 0 else self.param.ndim + dim
 
+    def _checkpoint_dim(self, placement_dim: int, param_shape) -> int:
+        """Map a placement dim from the DTensor shape to the checkpoint tensor shape."""
+        dim = self._normalize_param_dim(placement_dim)
+        ndim_diff = self.param.ndim - len(param_shape)
+        if ndim_diff > 0 and dim >= ndim_diff:
+            dim -= ndim_diff
+        return dim
+
     def _owns_local_expert(self, tensor_idx: int) -> bool:
         _, offsets = compute_local_shape_and_global_offset(
             self.param.shape, self.device_mesh, self.placements
         )
         return offsets[0] <= tensor_idx < offsets[0] + self.local_shape[0]
 
-    def _uses_unpacked_source_tensor(self, param_shape) -> bool:
+    def _source_tensor_needs_packing(self, param_shape) -> bool:
         # A single source tensor still missing the leading expert axis is being
         # converted into a packed expert parameter. In that case _StridedShard's
         # split groups do not exist yet.
