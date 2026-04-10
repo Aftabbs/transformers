@@ -888,7 +888,18 @@ class DtensorShardOperation:
             return param[...].to(device=device, dtype=dtype)
 
         if tensor_idx is not None and len(self.param.shape) == len(param_shape) + 1:
-            return self._shard_expert(param, tensor_idx, device, dtype)
+            # Expert parallelism: dim 0 (expert dimension) is sharded across ranks.
+            # When dim 0 is the only sharding placement, return the full expert or
+            # skip it. When TP also shards an inner dim, keep applying the remaining
+            # placements to the owned expert tensor.
+            expert_placements = [(i, p) for i, p in sharding_placements if self._normalize_param_dim(p.dim) == 0]
+            if expert_placements:
+                if not self._owns_local_expert(tensor_idx):
+                    return None
+                inner_placements = [(i, p) for i, p in sharding_placements if self._normalize_param_dim(p.dim) != 0]
+                if not inner_placements:
+                    return param[...].to(device=device, dtype=dtype)
+                return self._shard_nd(param, inner_placements, param_shape, device, dtype)
 
         return self._shard_nd(param, sharding_placements, param_shape, device, dtype)
 
@@ -898,10 +909,7 @@ class DtensorShardOperation:
         The DTensor parameter has an extra leading dimension stacking all experts.
         Skip experts not owned by this rank; return the full expert otherwise.
         """
-        _, offsets = compute_local_shape_and_global_offset(
-            self.param.shape, self.device_mesh, self.placements
-        )
-        if tensor_idx < offsets[0] or tensor_idx >= offsets[0] + self.local_shape[0]:
+        if not self._owns_local_expert(tensor_idx):
             return None
         return param[...].to(device=device, dtype=dtype)
 
@@ -922,7 +930,7 @@ class DtensorShardOperation:
                 # Adjust dim when DTensor has more dims than checkpoint tensor (e.g. MoE 3D vs 2D)
                 dim = placement.dim
                 if dim < 0:
-                    dim = len(param_shape) + dim
+                    dim = self.param.ndim + dim
                 ndim_diff = self.param.ndim - len(param_shape)
                 if ndim_diff > 0 and dim >= ndim_diff:
                     dim -= ndim_diff
@@ -965,14 +973,14 @@ class DtensorShardOperation:
             tensor = shards[rank]
         return tensor.to(device=device, dtype=dtype)
 
-    def _compute_dim_ranges(self, sharding_placements, param_shape) -> DimRanges:
+    def _compute_dim_ranges(self, sharding_placements, param_shape) -> DtensorShardOperation.DimRanges:
         """Compute per-dimension index ranges for this rank.
 
         Each sharding placement narrows the ranges on its tensor dimension:
         - ``Shard``: one contiguous sub-range per previous range.
         - ``_StridedShard``: multiple disjoint sub-ranges (one per split-factor group).
         """
-        dim_ranges: DimRanges = {}
+        dim_ranges: DtensorShardOperation.DimRanges = {}
         for mesh_dim_idx, placement in sharding_placements:
             sub_mesh = self._get_sub_mesh(mesh_dim_idx)
             rank = sub_mesh.get_local_rank()
@@ -980,7 +988,7 @@ class DtensorShardOperation:
             # Adjust dim when DTensor has more dims than checkpoint tensor (e.g. MoE 3D vs 2D)
             dim = placement.dim
             if dim < 0:
-                dim = len(param_shape) + dim
+                dim = self.param.ndim + dim
             ndim_diff = self.param.ndim - len(param_shape)
             if ndim_diff > 0 and dim >= ndim_diff:
                 dim -= ndim_diff
@@ -988,12 +996,18 @@ class DtensorShardOperation:
 
             if placement.is_shard():
                 new_ranges = self._contiguous_ranges(prev_ranges, rank, world_size)
+            elif self._uses_unpacked_source_tensor(param_shape):
+                # _StridedShard only makes sense once the packed axis exists. While
+                # loading pre-packed source tensors (e.g. w1/w3 before gate_up_proj
+                # concatenation), take the contiguous chunk for this rank and let the
+                # WeightConverter recreate the packed layout afterward.
+                new_ranges = self._contiguous_ranges(prev_ranges, rank, world_size)
             else:
                 new_ranges = self._strided_ranges(prev_ranges, rank, world_size, placement.split_factor)
             dim_ranges[dim] = new_ranges
         return dim_ranges
 
-    def _slice_and_read(self, param, param_shape, dim_ranges: DimRanges, device, dtype):
+    def _slice_and_read(self, param, param_shape, dim_ranges: DtensorShardOperation.DimRanges, device, dtype):
         """Build slices from computed ranges and read from the tensor.
 
         At most one dim can have multiple disjoint ranges (from ``_StridedShard``).
@@ -1065,6 +1079,21 @@ class DtensorShardOperation:
             return self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]]
         return self.device_mesh
 
+    def _normalize_param_dim(self, dim: int) -> int:
+        return dim if dim >= 0 else self.param.ndim + dim
+
+    def _owns_local_expert(self, tensor_idx: int) -> bool:
+        _, offsets = compute_local_shape_and_global_offset(
+            self.param.shape, self.device_mesh, self.placements
+        )
+        return offsets[0] <= tensor_idx < offsets[0] + self.local_shape[0]
+
+    def _uses_unpacked_source_tensor(self, param_shape) -> bool:
+        # A single source tensor still missing the leading expert axis is being
+        # converted into a packed expert parameter. In that case _StridedShard's
+        # split groups do not exist yet.
+        return self.param.ndim == len(param_shape) + 1
+
 @dataclass
 class ParallelMaterializationContext:
     distributed_operation: DtensorShardOperation
@@ -1077,10 +1106,7 @@ def get_parallel_materialization_context(
     renamed_key: str,
     source_pattern: str | None,
     empty_param,
-    device_mesh,
     device_map,
-    model=None,
-    tp_plan=None,
 ) -> ParallelMaterializationContext | None:
     """Return the parallel context needed to shard a tensor on read, or None if not applicable."""
     tensor_idx = (
@@ -1095,31 +1121,6 @@ def get_parallel_materialization_context(
             tensor_idx=tensor_idx,
             device=get_device(device_map, renamed_key, valid_torch_device=True),
         )
-
-    # MoE expert weights: look up the tp_plan for string-based shard styles
-    # (e.g. "packed_colwise", "rowwise") that tell us how to shard on read.
-    # Try both the full key and without the base model prefix since the
-    # tp_plan from config uses unprefixed keys.
-    if tp_plan is not None and device_mesh is not None:
-        from .integrations.tensor_parallel import _get_parameter_tp_plan
-
-        shard_style = _get_parameter_tp_plan(renamed_key, tp_plan)
-        if shard_style is None and model is not None:
-            prefix = getattr(model, "base_model_prefix", "")
-            if prefix and renamed_key.startswith(prefix + "."):
-                shard_style = _get_parameter_tp_plan(renamed_key[len(prefix) + 1 :], tp_plan)
-
-        if isinstance(shard_style, str):
-            from .integrations.tensor_parallel import MoEShardOperation
-
-            # Use TP sub-mesh for sharding, not the full (fsdp, tp) mesh
-            tp_mesh = device_mesh["tp"] if device_mesh.ndim > 1 and "tp" in (device_mesh.mesh_dim_names or ()) else device_mesh
-            param_name = renamed_key.rsplit(".", 1)[1] if "." in renamed_key else renamed_key
-            return ParallelMaterializationContext(
-                distributed_operation=MoEShardOperation(tp_mesh, param_name, empty_param),
-                tensor_idx=tensor_idx,
-                device=get_device(device_map, renamed_key, valid_torch_device=True),
-            )
 
     return None
 
@@ -1216,10 +1217,6 @@ def set_param_for_module(
         if isinstance(ref, DTensor):
             local_shape, global_offset = compute_local_shape_and_global_offset(ref.shape, ref.device_mesh, ref.placements)
             expected_shape = torch.Size(local_shape)
-        elif hasattr(module_obj, "_moe_tp_mesh"):
-            # MoE expert weights are sharded on read by MoEShardOperation.
-            # The model param is full-size but the loaded tensor is sharded — accept it.
-            expected_shape = param_value.shape
         else:
             expected_shape = ref.shape
 
@@ -1446,7 +1443,10 @@ def convert_and_load_state_dict_in_model(
     if load_config.device_map is not None:
         device_map = load_config.device_map
     elif device_mesh is not None:
-        device_map = {"": torch.device(device_mesh.device_type, torch.cuda.current_device())}
+        if device_mesh.device_type == "cpu":
+            device_map = {"": torch.device("cpu")}
+        else:
+            device_map = {"": torch.device(device_mesh.device_type, getattr(torch, device_mesh.device_type).current_device())}
     else:
         device_map = {"": "cpu"}
     disk_offload_folder = load_config.disk_offload_folder
@@ -1565,10 +1565,7 @@ def convert_and_load_state_dict_in_model(
                 renamed_key=renamed_key,
                 source_pattern=source_pattern,
                 empty_param=empty_param,
-                device_mesh=device_mesh,
                 device_map=device_map,
-                model=model,
-                tp_plan=tp_plan,
             ):
                 future_or_tensor = spawn_parallel_materialize(
                     thread_pool,

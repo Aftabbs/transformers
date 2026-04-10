@@ -13,12 +13,11 @@
 # limitations under the License.
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from typing import Literal
 
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     PrepareModuleInput,
@@ -27,6 +26,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.parallel.style import ParallelStyle
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from ..utils import logging
 from ..utils.import_utils import is_torch_available
@@ -76,180 +76,6 @@ def _get_parameter_tp_plan(parameter_name: str, tp_plan: dict[str, str], is_weig
 # =============================================================================
 
 
-if is_torch_available():
-    str_to_dtype = {
-        "BOOL": torch.bool,
-        "U8": torch.uint8,
-        "I8": torch.int8,
-        "I16": torch.int16,
-        "F16": torch.float16,
-        "BF16": torch.bfloat16,
-        "I32": torch.int32,
-        "F32": torch.float32,
-        "F64": torch.float64,
-        "I64": torch.int64,
-        "F8_E4M3": torch.float8_e4m3fn,
-    }
-
-
-def _blocks_to_block_sizes(total_size: int, blocks: int | list[int]) -> list[int]:
-    """
-    Convert block count or proportions to block sizes.
-
-    This function accepts
-
-    - The number of blocks (int), in which case the block size is
-      total_size//blocks; or
-    - A list of block sizes (list[int]).
-
-    In the second case, if sum(blocks) < total_size, the ratios between
-    the block sizes will be preserved. For instance, if blocks is
-    [2, 1, 1] and total_size is 1024, the returned block sizes are
-    [512, 256, 256].
-    """
-    if isinstance(blocks, list):
-        total_blocks = sum(blocks)
-        assert total_size % total_blocks == 0, f"Cannot split {total_size} in proportional blocks: {blocks}"
-        part_size = total_size // total_blocks
-        return [part_size * block for block in blocks]
-    else:
-        assert total_size % blocks == 0, f"Prepacked is not divisible by {blocks}"
-        single_size = total_size // blocks
-        return [single_size] * blocks
-
-
-def get_packed_weights(param, empty_param, device_mesh, rank, dim):
-    """
-    When weights are packed (gate_up_proj), we need to make sure each shard gets its correct share.
-    So if you have: gate_proj       ( 16, 5120, 8190)
-    and             up_proj         ( 16, 5120, 8190)
-    packed as       gate_up_proj    ( 16, 5120, 2 * 8190)
-    And you shard along the last dimension, you need to interleave the gate and up values:
-
-    Now, if we shard along the last dimension across TP_size (Tensor Parallelism size), we must interleave the values from gate and up projections correctly.
-
-    Let's take TP_size = 4 for an example:
-
-    Packed tensor `gate_up_proj`
-    ---------------------------------------------------------------
-    [ G0  G1  G2  G3 | G4  G5  G6  G7 | ... | U0  U1  U2  U3 | U4  U5  U6  U7 | ... ]
-     ↑─────────────↑   ↑─────────────↑        ↑─────────────↑  ↑─────────────↑
-       Gate Slice 0      Gate Slice 1            Up Slice 0       Up Slice 1
-
-    Explanation:
-    - The first half of the tensor (left of the center) holds the gate_proj values.
-    - The second half (right of the center) holds the up_proj values.
-    - For TP=4, we divide each half into 4 slices. In this example, we show two slices for brevity.
-    - Each shard receives one slice from the gate part and the corresponding slice from the up part.
-
-    For instance:
-    • Shard 0 gets: [ Gate Slice 0, Up Slice 0 ] = [ G0, G1, G2, G3, U0, U1, U2, U3 ]
-    • Shard 1 gets: [ Gate Slice 1, Up Slice 1 ] = [ G4, G5, G6, G7, U4, U5, U6, U7 ]
-    • … and so on.
-
-    This ensures that each shard receives an equal portion of both gate and up projections, maintaining consistency across tensor parallelism.
-    """
-    slice_ = param
-    total_size = empty_param.shape[dim]
-    world_size = device_mesh.size()
-    block_sizes = _blocks_to_block_sizes(total_size=total_size, blocks=2)
-
-    tensors_slices = []
-    block_offset = 0
-    for block_size in block_sizes:
-        shard_block_size = block_size // world_size
-        start = rank * shard_block_size
-        stop = (rank + 1) * shard_block_size
-        tensors_slices += range(block_offset + start, block_offset + stop)
-        block_offset += block_size
-
-    slice_dtype = slice_.get_dtype()
-    # Handle F8_E4M3 dtype by converting to float16 before slicing
-    # Without upcasting, the slicing causes : RuntimeError: "index_cpu" not implemented for 'Float8_e4m3fn'
-    casted = False
-    if slice_dtype == "F8_E4M3" or slice_dtype == "F8_E5M2":
-        slice_ = slice_[...].to(torch.float16)
-        casted = True
-
-    if dim == 0:
-        tensor = slice_[tensors_slices, ...]
-    elif dim == 1 or dim == -2:
-        tensor = slice_[:, tensors_slices, ...]
-    elif dim == 2 or dim == -1:
-        tensor = slice_[..., tensors_slices]
-    else:
-        raise ValueError(f"Unsupported dim {dim}, only dim 0, 1 or 2 are supported")
-
-    if casted:
-        return tensor
-    else:
-        return tensor.to(str_to_dtype[slice_dtype])
-
-
-def repack_weights(
-    packed_parameter: torch.Tensor,
-    sharded_dim: int,  # The dimension index in the global tensor that was sharded
-    world_size: int,
-    num_blocks: int = 2,
-) -> torch.Tensor:
-    """
-    Reorders a tensor that was reconstructed from sharded packed weights into its canonical packed format.
-
-    For example, if a weight was packed (e.g., gate_proj and up_proj) and then sharded,
-    DTensor.full_tensor() might produce an interleaved layout like [G0, U0, G1, U1, ...]
-    along the sharded dimension. This function reorders it to [G0, G1, ..., U0, U1, ...].
-    This is an inverse operation to get_packed_weights.
-
-    Args:
-        reconstructed_tensor: The tensor reconstructed from DTensor (e.g., via .full_tensor().contiguous()).
-        sharded_dim: The dimension index in the reconstructed_tensor that was originally sharded.
-        world_size: The tensor parallel world size.
-        num_packed_projs: The number of projections that were packed together (e.g., 2 for gate_up_proj).
-
-    Returns:
-        The reordered tensor in canonical packed format.
-    """
-
-    if num_blocks != 2:
-        raise ValueError(
-            "Num blocks different from 2 is not supported yet. This is most likely a bug in your implementation as we only pack gate and up projections together."
-        )
-
-    actual_sharded_dim = sharded_dim if sharded_dim >= 0 else sharded_dim + packed_parameter.ndim
-    total_size_on_sharded_dim = packed_parameter.shape[actual_sharded_dim]
-    original_block_size_on_dim = total_size_on_sharded_dim // num_blocks
-    shard_chunk_size = original_block_size_on_dim // world_size
-
-    prefix_shape = packed_parameter.shape[:actual_sharded_dim]
-    suffix_shape = packed_parameter.shape[actual_sharded_dim + 1 :]
-
-    tensor_view = packed_parameter.view(
-        *prefix_shape,
-        world_size,
-        num_blocks,
-        shard_chunk_size,
-        *suffix_shape,
-    )
-
-    # Permute to bring num_packed_projs first, then world_size, then shard_chunk_size
-    # This groups all chunks of G together, then all chunks of U together.
-    # Target order of these middle dimensions: (num_packed_projs, world_size, shard_chunk_size)
-    # Current order of view's middle dimensions: (world_size, num_packed_projs, shard_chunk_size)
-    # Absolute indices of the dimensions to be permuted (world_size, num_packed_projs)
-    axis_ws_abs = len(prefix_shape)
-    axis_npp_abs = len(prefix_shape) + 1
-
-    permute_order = list(range(tensor_view.ndim))
-    permute_order[axis_ws_abs], permute_order[axis_npp_abs] = permute_order[axis_npp_abs], permute_order[axis_ws_abs]
-
-    tensor_permuted = tensor_view.permute(*permute_order)
-
-    # Reshape back to the original tensor's ndim, with the sharded dimension now correctly ordered as [G_all, U_all].
-    # The final shape should be the same as reconstructed_tensor.
-    final_ordered_tensor = tensor_permuted.reshape_as(packed_parameter)
-
-    return final_ordered_tensor
-
 
 # =============================================================================
 # High-Level API Functions
@@ -268,57 +94,14 @@ def _to_cpu_fresh(tensor: torch.Tensor) -> torch.Tensor:
     return out.contiguous()
 
 
-# Maps string tp_plan entries (MoE experts) to their weight shard dimension.
-_STRING_PLAN_TO_SHARD_DIM = {
-    "packed_colwise": -2,
-    "rowwise": -1,
-}
-
-
-def _gather_full_param(tensor, shard_dim: int | None, tp_mesh, tp_size: int, is_packed: bool) -> torch.Tensor:
-    """Gather a single sharded parameter (DTensor or plain MoE tensor) into a full tensor.
-
-    - DTensor: ``redistribute([Replicate()])`` (collective across the DTensor's mesh).
-    - Plain tensor with a ``shard_dim``: ``all_gather`` on the TP process group.
-
-    If ``is_packed``, repacks interleaved gate/up shards back to canonical layout.
-    """
-    if isinstance(tensor, DTensor):
-        with torch.no_grad():
-            full = tensor.redistribute(placements=[Replicate()] * tensor.device_mesh.ndim, async_op=False).to_local()
-
-        # Only repack if the DTensor was actually sharded along the packed axis
-        if is_packed and shard_dim is not None:
-            for p in tensor.placements:
-                if not p.is_replicate() and hasattr(p, "dim") and p.dim == shard_dim:
-                    full = repack_weights(full, shard_dim, tp_size, 2)
-                    break
-    else:
-        # Plain MoE tensor — manual all_gather
-        world_size = tp_mesh.size()
-        process_group = tp_mesh.get_group("tp") if "tp" in (tp_mesh.mesh_dim_names or {}) else None
-        norm_dim = shard_dim + tensor.ndim if shard_dim < 0 else shard_dim
-        gathered = [torch.empty_like(tensor) for _ in range(world_size)]
-        dist.all_gather(gathered, tensor.contiguous(), group=process_group)
-        full = torch.cat(gathered, dim=norm_dim)
-        if is_packed:
-            full = repack_weights(full, shard_dim, tp_size, 2)
-
-    return full
-
-
 def gather_full_state_dict(model) -> dict[str, torch.Tensor]:
     """Gather all sharded params to full plain tensors for saving.
 
-    Handles FSDP unshard, TP DTensor gather, and MoE plain tensor gather.
+    Handles FSDP unshard and TP DTensor gather.
     Streams one parameter at a time to avoid holding all full tensors on GPU.
     Only rank 0 accumulates the result; other ranks return ``{}``.
     """
-    tp_plan = getattr(model, "_tp_plan", {}) or {}
-    device_mesh = model.device_mesh
-    base_prefix = model.base_model_prefix
     tp_size = model.tp_size
-    tp_mesh = device_mesh["tp"] if device_mesh.ndim > 1 else device_mesh
     is_rank0 = dist.get_rank() == 0
 
     # Get state dict — FSDP unshard if needed (returns DTensors, not full tensors)
@@ -335,31 +118,13 @@ def gather_full_state_dict(model) -> dict[str, torch.Tensor]:
             return {k: _to_cpu_fresh(v) for k, v in state_dict.items()}
         return {}
 
-    #NOTE(3outeille): This for MoE plain tensors
-    def lookup_plan(key):
-        plan = _get_parameter_tp_plan(key, tp_plan)
-        if plan is None and base_prefix and key.startswith(base_prefix + "."):
-            plan = _get_parameter_tp_plan(key[len(base_prefix) + 1 :], tp_plan)
-        return plan
-
     # Stream: gather one param at a time, only rank 0 keeps the CPU copy
     result = {}
     for key, tensor in state_dict.items():
-        current_plan = lookup_plan(key)
-
-        # Resolve shard dim for string plan entries (MoE experts)
-        shard_dim = None
-        if isinstance(current_plan, str) and current_plan in _STRING_PLAN_TO_SHARD_DIM:
-            shard_dim = _STRING_PLAN_TO_SHARD_DIM[current_plan]
-            if shard_dim < 0:
-                shard_dim += len(tensor.shape)
-
-        is_sharded = isinstance(tensor, DTensor) or (tp_mesh is not None and shard_dim is not None)
-        is_packed = isinstance(current_plan, str) and "packed" in current_plan
-
-        if is_sharded:
+        if isinstance(tensor, DTensor):
             # All ranks participate in the collective, only rank 0 keeps the result
-            full = _gather_full_param(tensor, shard_dim, tp_mesh, tp_size, is_packed)
+            with torch.no_grad():
+                full = tensor.redistribute(placements=[Replicate()] * tensor.device_mesh.ndim, async_op=False).to_local()
             if is_rank0:
                 result[key] = _to_cpu_fresh(full)
             del full
@@ -441,53 +206,22 @@ class PrepareModuleInputOutput(ParallelStyle):
         return module
 
 
-class MoEShardOperation:
-    """Shards MoE expert weights during loading.
+# Maps string tp_plan entries for MoE experts to DTensor placements.
+# Used by MoEExpertsParallel._partition_fn to create DTensors from the config plan.
+_STRING_TO_PLACEMENT = {
+    "packed_colwise": lambda: _StridedShard(dim=-2, split_factor=2),
+    "colwise": lambda: Shard(-2),
+    "rowwise": lambda: Shard(-1),
+}
 
-    Same ``shard_tensor`` interface as ``DtensorShardOperation`` so it plugs
-    into ``ParallelMaterializationContext`` / ``spawn_parallel_materialize``.
-
-    - Non-packed weights (down_proj): sharded on read
-    - Packed weights (gate_up_proj): returned full — ``set_param_for_module``
-      shards after the ``WeightConverter`` merges + concatenates.
-    """
-
-    def __init__(self, device_mesh, param_name, empty_param):
-        self.device_mesh = device_mesh
-        self.rank = device_mesh.get_local_rank()
-        self.param_name = param_name
-        self.empty_param = empty_param
-
-    def shard_tensor(self, param, tensor_idx=None, device=None, dtype=None):
-        # Shard each individual expert tensor on read (before merge/concatenation).
-        # Individual w1/w3 are 2D and should shard their output features on dim 0.
-        # Some checkpoints already store fused 3D expert tensors (e.g. gate_up_proj),
-        # where the expert dimension is leading and must stay replicated.
-        param_shape = list(param.shape) if isinstance(param, torch.Tensor) else param.get_shape()
-
-        if "gate" in self.param_name or "up" in self.param_name:
-            if len(param_shape) > 2:
-                return get_packed_weights(param, self.empty_param, self.device_mesh, self.rank, dim=-2).to(
-                    device=device, dtype=dtype
-                )
-            dim = 0
-        else:
-            dim = len(param_shape) - 1  # rowwise: shard input features (last dim)
-
-        world_size = self.device_mesh.size()
-        shard_size = math.ceil(param_shape[dim] / world_size)
-        start = self.rank * shard_size
-        end = min(start + shard_size, param_shape[dim])
-
-        slices = [slice(None)] * len(param_shape)
-        slices[dim] = slice(start, end)
-        return param[tuple(slices)].to(device=device, dtype=dtype)
 
 
 class MoEExpertsParallel(ParallelStyle):
     """Hybrid parallel style for MoE expert modules.
 
-    Weights are plain tensors, sharded during loading via ``MoEShardOperation``.
+    Weights are converted to DTensors based on the per-parameter string plan
+    entries (e.g. ``"packed_colwise"``, ``"rowwise"``) attached to the module
+    by ``apply_tensor_parallel`` as ``_moe_param_plan``.
     Communication uses DTensor ``from_local``/``to_local`` on activations only —
     compatible with ``grouped_mm``.
     """
@@ -498,11 +232,17 @@ class MoEExpertsParallel(ParallelStyle):
 
     @staticmethod
     def _partition_fn(name, module, device_mesh):
-        # Mark module and params for MoE sharding during loading.
-        # No DTensor distribution — weights stay as plain Parameters.
-        module._moe_tp_mesh = device_mesh
+        param_plan = getattr(module, "_moe_param_plan", {})
         for param_name, param in module.named_parameters(recurse=False):
-            param._moe_shard_info = {"mesh": device_mesh, "param_name": param_name}
+            plan_str = param_plan.get(param_name)
+            if plan_str is None:
+                continue
+            placement_fn = _STRING_TO_PLACEMENT.get(plan_str)
+            if placement_fn is None:
+                continue
+            placement = placement_fn()
+            dtensor = distribute_tensor(param.data, device_mesh, [placement])
+            module._parameters[param_name] = torch.nn.Parameter(dtensor, requires_grad=param.requires_grad)
 
     @staticmethod
     def _uses_partial_outputs(mod) -> bool:
@@ -541,10 +281,33 @@ class MoEExpertsParallel(ParallelStyle):
         if not isinstance(top_k_weights, DTensor):
             top_k_weights = DTensor.from_local(top_k_weights, device_mesh, [Replicate()], run_check=False)
         top_k_weights = top_k_weights.to_local()
+        local_param_shadows = {}
+        for param_name, param in list(mod.named_parameters(recurse=False)):
+            if isinstance(param, DTensor):
+                # grouped_mm expects plain tensors, but we must restore the
+                # original DTensor params after the forward so save_pretrained
+                # still sees the canonical sharded weights.
+                local_param_shadows[param_name] = param
+                mod._parameters.pop(param_name)
+                setattr(mod, param_name, param.to_local())
+        if local_param_shadows:
+            shadow_stack = getattr(mod, "_moe_local_param_shadows", None)
+            if shadow_stack is None:
+                shadow_stack = []
+                mod._moe_local_param_shadows = shadow_stack
+            shadow_stack.append(local_param_shadows)
         return (hidden_states, top_k_index, top_k_weights)
 
     @staticmethod
     def _prepare_output_fn(output_layouts, mod, outputs, device_mesh):
+        shadow_stack = getattr(mod, "_moe_local_param_shadows", None)
+        if shadow_stack:
+            for param_name, param in shadow_stack.pop().items():
+                if hasattr(mod, param_name):
+                    delattr(mod, param_name)
+                mod.register_parameter(param_name, param)
+        if outputs is None:
+            return None
         # Plain TP expert weights produce partial outputs that need an all-reduce.
         # TP+FSDP can leave experts replicated across TP and sharded only across
         # experts/FSDP, in which case the local output is already complete.
@@ -561,13 +324,14 @@ class MoEExpertsParallel(ParallelStyle):
         return outputs.to_local()
 
     def _apply(self, module, device_mesh):
-        # Don't use PyTorch's distribute_module — it auto-converts all params
-        # to Replicate DTensors, which breaks shard-on-read for MoE weights.
-        # Register hooks manually instead.
+        # Don't use PyTorch's distribute_module — it would auto-convert all
+        # params to Replicate DTensors. We create DTensors with proper Shard
+        # placements in _partition_fn instead, and register hooks manually.
         self._partition_fn(module.__class__.__name__, module, device_mesh)
         module.register_forward_pre_hook(lambda mod, inputs: self._prepare_input_fn(mod, inputs, device_mesh))
         module.register_forward_hook(
-            lambda mod, inputs, outputs: self._prepare_output_fn(self.output_layouts, mod, outputs, device_mesh)
+            lambda mod, inputs, outputs: self._prepare_output_fn(self.output_layouts, mod, outputs, device_mesh),
+            always_call=True,
         )
         return module
 
@@ -584,20 +348,46 @@ class TPStyle:
         """Convert to the corresponding PyTorch DTensor ParallelStyle."""
         if self.kind == "colwise":
             match self.comm:
-                case "none":          return ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1), use_local_output=self.use_local_output)
-                case "allgather":     return ColwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=self.use_local_output)
-                case "loss_parallel": return ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False)
+                case "none":
+                    return ColwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Shard(-1), use_local_output=self.use_local_output
+                    )
+                case "allgather":
+                    return ColwiseParallel(
+                        input_layouts=Replicate(),
+                        output_layouts=Replicate(),
+                        use_local_output=self.use_local_output,
+                    )
+                case "loss_parallel":
+                    return ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False)
         elif self.kind == "rowwise":
             match self.comm:
-                case "allreduce":      return RowwiseParallel(input_layouts=Shard(-1), output_layouts=Replicate(), use_local_output=self.use_local_output)
-                case "reduce_scatter": return RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1), use_local_output=self.use_local_output)
+                case "allreduce":
+                    return RowwiseParallel(
+                        input_layouts=Shard(-1),
+                        output_layouts=Replicate(),
+                        use_local_output=self.use_local_output,
+                    )
+                case "reduce_scatter":
+                    return RowwiseParallel(
+                        input_layouts=Shard(-1), output_layouts=Shard(1), use_local_output=self.use_local_output
+                    )
         elif self.kind == "vocab":
             match self.comm:
-                case "allreduce":      return RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=self.use_local_output)
-                case "reduce_scatter": return RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=self.use_local_output)
+                case "allreduce":
+                    return RowwiseParallel(
+                        input_layouts=Replicate(),
+                        output_layouts=Replicate(),
+                        use_local_output=self.use_local_output,
+                    )
+                case "reduce_scatter":
+                    return RowwiseParallel(
+                        input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=self.use_local_output
+                    )
         elif self.kind == "activation":
             match self.comm:
-                case "none": return SequenceParallel(sequence_dim=self.sequence_dim, use_local_output=self.use_local_output)
+                case "none":
+                    return SequenceParallel(sequence_dim=self.sequence_dim, use_local_output=self.use_local_output)
         elif self.kind == "module":
             match self.comm:
                 case "allgather":
@@ -616,8 +406,10 @@ class TPStyle:
                     return PrepareModuleInputOutput(use_local_output=self.use_local_output)
         elif self.kind == "moe_experts":
             match self.comm:
-                case "allreduce":      return MoEExpertsParallel(output_layouts=Replicate())
-                case "reduce_scatter": return MoEExpertsParallel(output_layouts=Shard(1))
+                case "allreduce":
+                    return MoEExpertsParallel(output_layouts=Replicate())
+                case "reduce_scatter":
+                    return MoEExpertsParallel(output_layouts=Shard(1))
         raise ValueError(
             f"Invalid TPStyle({self.kind!r}, {self.comm!r}). Valid combinations:\n"
             f"  colwise:     none, allgather, loss_parallel\n"
@@ -673,6 +465,17 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
             continue
         else:
             parallelize_plan[name] = style_value
+
+    # For MoE modules, collect per-parameter string plan entries and attach them
+    # so _partition_fn can create DTensors with the correct placements.
+    for name, mod in model.named_modules():
+        if name in parallelize_plan and isinstance(parallelize_plan[name], MoEExpertsParallel):
+            param_plan = {}
+            for pname, _ in mod.named_parameters(recurse=False):
+                child_style = _get_parameter_tp_plan(f"{name}.{pname}", tp_plan)
+                if isinstance(child_style, str):
+                    param_plan[pname] = child_style
+            mod._moe_param_plan = param_plan
 
     parallelize_module(model, tp_mesh, parallelize_plan)
 

@@ -891,6 +891,19 @@ class TestDtensorShardOperation(unittest.TestCase):
             )
             torch.testing.assert_close(op.shard_tensor(tensor), expected[rank], msg=f"rank {rank}")
 
+    def test_prepacked_strided_shard_uses_contiguous_source_slice(self):
+        """Pre-concat w1/w3 tensors should shard contiguously before gate/up packing."""
+        tensor = torch.arange(8).reshape(4, 2).float()
+        for rank, expected in [(0, tensor[:2]), (1, tensor[2:])]:
+            mesh = FakeMesh(shape=(2,), rank=rank)
+            op = _make_dtensor_shard_op(
+                mesh,
+                [_StridedShard(dim=1, split_factor=2)],
+                param_shape=(8, 8, 2),
+                local_shape=(8, 4, 2),
+            )
+            torch.testing.assert_close(op.shard_tensor(tensor, tensor_idx=0), expected, msg=f"rank {rank}")
+
     def test_expert_filtering(self):
         """Mixtral-style experts: skip non-owned, return owned."""
         mesh = FakeMesh(shape=(2,), rank=1)
@@ -903,6 +916,33 @@ class TestDtensorShardOperation(unittest.TestCase):
             # rank 1 owns experts 2,3 (offset=2)
             self.assertIsNone(op.shard_tensor(expert_tensor, tensor_idx=0))
             torch.testing.assert_close(op.shard_tensor(expert_tensor, tensor_idx=2), expert_tensor)
+
+    def test_expert_filtering_preserves_inner_sharding(self):
+        """MoE expert ownership checks should still apply TP sharding on inner dims."""
+        tensor = torch.arange(8).reshape(4, 2).float()
+        expected = {
+            0: tensor[:2],
+            1: tensor[2:],
+            2: None,
+            3: None,
+        }
+        for rank in range(4):
+            mesh = FakeMesh(shape=(2, 2), rank=rank)
+            op = _make_dtensor_shard_op(mesh, [Shard(0), Shard(1)], param_shape=(4, 4, 2), local_shape=(2, 2, 2))
+
+            def fake_local_shape_and_offset(*args, **kwargs):
+                expert_rank, tp_rank = mesh.get_coordinate()
+                return torch.Size([2, 2, 2]), torch.Size([2 * expert_rank, 2 * tp_rank, 0])
+
+            with patch(
+                "transformers.core_model_loading.compute_local_shape_and_global_offset",
+                side_effect=fake_local_shape_and_offset,
+            ):
+                shard = op.shard_tensor(tensor, tensor_idx=1)
+                if expected[rank] is None:
+                    self.assertIsNone(shard)
+                else:
+                    torch.testing.assert_close(shard, expected[rank], msg=f"rank {rank}")
 
 
 class TestConversionMapping(unittest.TestCase):
