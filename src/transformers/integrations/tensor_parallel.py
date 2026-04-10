@@ -257,9 +257,8 @@ _STRING_TO_PLACEMENT = {
 class MoEExpertsParallel(ParallelStyle):
     """Hybrid parallel style for MoE expert modules.
 
-    Weights are converted to DTensors based on the per-parameter string plan
-    entries (e.g. ``"packed_colwise"``, ``"rowwise"``) attached to the module
-    by ``apply_tensor_parallel`` as ``_moe_param_plan``.
+    Converts expert weights to DTensors based on the ``shard_plan`` (e.g.
+    ``{"gate_up_proj": "packed_colwise", "down_proj": "rowwise"}``).
     Communication uses DTensor ``from_local``/``to_local`` on activations only —
     compatible with ``grouped_mm``.
     """
@@ -267,12 +266,12 @@ class MoEExpertsParallel(ParallelStyle):
     def __init__(self, output_layouts=None):
         super().__init__()
         self.output_layouts = output_layouts or Replicate()
+        self._moe_shard_plan: dict[str, str] = {}
 
     @staticmethod
-    def _partition_fn(name, module, device_mesh):
-        param_plan = getattr(module, "_moe_param_plan", {})
+    def _partition_fn(name, module, device_mesh, shard_plan):
         for param_name, param in module.named_parameters(recurse=False):
-            plan_str = param_plan.get(param_name)
+            plan_str = shard_plan.get(param_name)
             if plan_str is None:
                 continue
             placement_fn = _STRING_TO_PLACEMENT.get(plan_str)
@@ -365,7 +364,7 @@ class MoEExpertsParallel(ParallelStyle):
         # Don't use PyTorch's distribute_module — it would auto-convert all
         # params to Replicate DTensors. We create DTensors with proper Shard
         # placements in _partition_fn instead, and register hooks manually.
-        self._partition_fn(module.__class__.__name__, module, device_mesh)
+        self._partition_fn(module.__class__.__name__, module, device_mesh, self._moe_shard_plan)
         module.register_forward_pre_hook(lambda mod, inputs: self._prepare_input_fn(mod, inputs, device_mesh))
         module.register_forward_hook(
             lambda mod, inputs, outputs: self._prepare_output_fn(self.output_layouts, mod, outputs, device_mesh),
@@ -381,6 +380,7 @@ class TPStyle:
     sequence_dim: int = 1
     use_local_output: bool = True
     input_key: str | None = None
+    shard_plan: dict[str, str] | None = None
 
     def to_dtensor_style(self) -> ParallelStyle:
         """Convert to the corresponding PyTorch DTensor ParallelStyle."""
@@ -496,24 +496,14 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
             continue
 
         if isinstance(style_value, TPStyle):
-            parallelize_plan[name] = style_value.to_dtensor_style()
-        elif isinstance(style_value, str):
-            # String entries (e.g. "packed_colwise", "rowwise") are for parameter-level
-            # shard-on-read during loading, not for parallelize_module. Skip them.
-            continue
+            dtensor_style = style_value.to_dtensor_style()
+            parallelize_plan[name] = dtensor_style
+            # For MoE modules, attach the per-parameter shard plan from TPStyle
+            # so _partition_fn can create DTensors with the correct placements.
+            if isinstance(dtensor_style, MoEExpertsParallel) and style_value.shard_plan:
+                dtensor_style._moe_shard_plan = style_value.shard_plan
         else:
             parallelize_plan[name] = style_value
-
-    # For MoE modules, collect per-parameter string plan entries and attach them
-    # so _partition_fn can create DTensors with the correct placements.
-    for name, mod in model.named_modules():
-        if name in parallelize_plan and isinstance(parallelize_plan[name], MoEExpertsParallel):
-            param_plan = {}
-            for pname, _ in mod.named_parameters(recurse=False):
-                child_style = _get_parameter_tp_plan(f"{name}.{pname}", tp_plan)
-                if isinstance(child_style, str):
-                    param_plan[pname] = child_style
-            mod._moe_param_plan = param_plan
 
     parallelize_module(model, tp_mesh, parallelize_plan)
 
