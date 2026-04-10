@@ -821,41 +821,26 @@ def spawn_materialize(
     tensor: torch.Tensor,
     device=None,
     dtype=None,
+    sharding_op: DtensorShardOperation | None = None,
+    tensor_idx: int | None = None,
 ) -> Future | Callable:
-    """Materialize a tensor from file asynchronously if `thread_pool` is provided, or return a Callable that will
-    load the tensor synchronously when called."""
+    """Materialize (and optionally shard) a tensor, asynchronously if a thread pool is provided.
+
+    When ``sharding_op`` is given the tensor is sharded according to the DTensor
+    placement strategy; otherwise it is simply copied to *device*/*dtype*.
+    Without a thread pool a deferred callable is returned instead of a Future.
+    """
 
     def _job():
+        if sharding_op is not None:
+            return sharding_op.shard_tensor(tensor, tensor_idx=tensor_idx, device=device, dtype=dtype)
         return _materialize_copy(tensor, device, dtype)
 
     if thread_pool is not None:
         return thread_pool.submit(_job)
-    else:
-        # Return the Callable here, not the Tensor itself, so we actually delay loading to avoid saturating cpu
-        # memory during Conversion
-        return _job
-
-
-def spawn_parallel_materialize(
-    thread_pool: ThreadPoolExecutor | None,
-    tensor: torch.Tensor,
-    sharding_method,
-    tensor_idx,
-    device=None,
-    dtype=None,
-) -> Future | Callable:
-    """Materialize and shard a tensor according to the active parallelism strategy if `thread_pool` is provided, or
-    return a Callable that will load the tensor synchronously when called."""
-
-    def _job():
-        return sharding_method.shard_tensor(tensor, tensor_idx=tensor_idx, device=device, dtype=dtype)
-
-    if thread_pool is not None:
-        return thread_pool.submit(_job)
-    else:
-        # Return the Callable here, not the Tensor itself, so we actually delay loading to avoid saturating cpu
-        # memory during Conversion
-        return _job
+    # Return the Callable here, not the Tensor itself, so we actually delay loading
+    # to avoid saturating cpu memory during Conversion
+    return _job
 
 
 class DtensorShardOperation:
@@ -1093,36 +1078,6 @@ class DtensorShardOperation:
         # converted into a packed expert parameter. In that case _StridedShard's
         # split groups do not exist yet.
         return self.param.ndim == len(param_shape) + 1
-
-@dataclass
-class ParallelMaterializationContext:
-    distributed_operation: DtensorShardOperation
-    tensor_idx: int | None
-    device: str | None
-
-
-def get_parallel_materialization_context(
-    mapping,
-    renamed_key: str,
-    source_pattern: str | None,
-    empty_param,
-    device_map,
-) -> ParallelMaterializationContext | None:
-    """Return the parallel context needed to shard a tensor on read, or None if not applicable."""
-    tensor_idx = (
-        len(mapping.collected_tensors.get(source_pattern, []))
-        if isinstance(mapping, WeightConverter) and isinstance(mapping.operations[0], MergeModulelist)
-        else None
-    )
-
-    if isinstance(empty_param, DTensor):
-        return ParallelMaterializationContext(
-            distributed_operation=DtensorShardOperation(empty_param),
-            tensor_idx=tensor_idx,
-            device=get_device(device_map, renamed_key, valid_torch_device=True),
-        )
-
-    return None
 
 
 def dot_natural_key(s: str):
@@ -1559,24 +1514,19 @@ def convert_and_load_state_dict_in_model(
             elif empty_param is not None and empty_param.dtype != _dtype:
                 _dtype = empty_param.dtype  # usually correct when initializing
 
-            # 4. Handle parallel shard-on-read or device_map placement
-            if parallel_context := get_parallel_materialization_context(
-                mapping=mapping,
-                renamed_key=renamed_key,
-                source_pattern=source_pattern,
-                empty_param=empty_param,
-                device_map=device_map,
-            ):
-                future_or_tensor = spawn_parallel_materialize(
-                    thread_pool,
-                    tensor,
-                    parallel_context.distributed_operation,
-                    parallel_context.tensor_idx,
-                    parallel_context.device,
-                    _dtype,
+            # 4. Materialize tensor — shard-on-read for DTensor params, plain copy otherwise
+            param_device = get_device(device_map, renamed_key, valid_torch_device=True)
+            if isinstance(empty_param, DTensor):
+                tensor_idx = (
+                    len(mapping.collected_tensors.get(source_pattern, []))
+                    if isinstance(mapping, WeightConverter) and isinstance(mapping.operations[0], MergeModulelist)
+                    else None
+                )
+                future_or_tensor = spawn_materialize(
+                    thread_pool, tensor, param_device, _dtype,
+                    sharding_op=DtensorShardOperation(empty_param), tensor_idx=tensor_idx,
                 )
             else:
-                param_device = get_device(device_map, renamed_key, valid_torch_device=True)
                 future_or_tensor = spawn_materialize(thread_pool, tensor, param_device, _dtype)
 
             mapping.add_tensor(renamed_key, original_key, source_pattern, future_or_tensor)
