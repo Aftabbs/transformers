@@ -134,6 +134,44 @@ def gather_full_state_dict(model) -> dict[str, torch.Tensor]:
     return result
 
 
+def _redistribute_dtensor(tensor: DTensor, target_placements: tuple) -> DTensor:
+    """Redistribute a DTensor via Replicate as an intermediate step.
+
+    PyTorch doesn't implement all placement conversions (e.g. _StridedShard↔Shard).
+    Going through Replicate first is always supported.
+    """
+    with torch.no_grad():
+        replicated = tensor.redistribute(placements=[Replicate()] * tensor.device_mesh.ndim)
+        return replicated.redistribute(placements=target_placements)
+
+def convert_strided_to_shard(state_dict: dict) -> dict[str, tuple]:
+    # Convert _StridedShard DTensors in a state dict to plain Shard for DCP compatibility.
+    placement_map: dict[str, tuple] = {}
+    for key, value in state_dict.items():
+        if isinstance(value, dict):
+            nested = convert_strided_to_shard(value)
+            for nk, nv in nested.items():
+                placement_map[f"{key}.{nk}"] = nv
+        elif isinstance(value, DTensor) and any(isinstance(p, _StridedShard) for p in value.placements):
+            placement_map[key] = tuple(value.placements)
+            shard_placements = tuple(Shard(p.dim) if isinstance(p, _StridedShard) else p for p in value.placements)
+            state_dict[key] = _redistribute_dtensor(value, shard_placements)
+    return placement_map
+
+
+def restore_strided_from_shard(state_dict: dict, placement_map: dict[str, tuple]) -> None:
+    # Restore _StridedShard placements after dcp.load.
+    def _resolve(d, dotted_key):
+        parts = dotted_key.split(".", 1)
+        if len(parts) == 2 and parts[0] in d and isinstance(d[parts[0]], dict):
+            return _resolve(d[parts[0]], parts[1])
+        return d, dotted_key
+
+    for key, original_placements in placement_map.items():
+        container, leaf_key = _resolve(state_dict, key)
+        if leaf_key in container and isinstance(container[leaf_key], DTensor):
+            container[leaf_key] = _redistribute_dtensor(container[leaf_key], original_placements)
+
 def verify_tp_plan(expected_keys: list[str], tp_plan: dict[str, str | TPStyle] | None):
     """
     Verify the TP plan of the model, log a warning if the layers that were not sharded and the rules that were not applied.

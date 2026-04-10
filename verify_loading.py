@@ -61,7 +61,17 @@ def materialize_full_logits(logits: torch.Tensor) -> torch.Tensor:
 def compute_loss(model):
     inputs = tokenizer(text, return_tensors="pt").to(f"cuda:{local_rank}")
     input_ids = inputs["input_ids"]
+    # Pad sequence length to a multiple of tp_size so DTensor Shard(1) splits evenly
+    # across ranks in SP mode. Always pad (even for non-TP modes) so that all modes
+    # compute on the same input and losses are directly comparable.
+    max_tp = max((c.tp_size if c is not None else 1) for c in configs.values())
+    seq_len = input_ids.shape[1]
+    if seq_len % max_tp != 0:
+        pad_len = max_tp - (seq_len % max_tp)
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        input_ids = torch.cat([input_ids, input_ids.new_full((1, pad_len), pad_token_id)], dim=1)
     labels = input_ids.clone()
+    labels[:, seq_len:] = -100  # ignore padding in loss
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
     model.eval()

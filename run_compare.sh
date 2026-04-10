@@ -4,28 +4,53 @@ set -euo pipefail
 SCRIPT="train_fsdp_tp.py"
 LOG_FSDP_TP="log.txt"
 LOG_FSDP_ONLY="ref.txt"
-DEBUG_FSDP_TP="./debug_fsdp_tp"
-DEBUG_FSDP_ONLY="./debug_fsdp_only"
 
-MODEL_NAME="${MODEL_NAME:-hf-internal-testing/Mixtral-tiny}"
-COMMON_ARGS="--model_name $MODEL_NAME --num_steps 20 --lr 3e-4 --seed 42"
+MODEL_NAME="${MODEL_NAME:-hf-internal-testing/tiny-random-MixtralForCausalLM}"
+COMMON_ARGS="--model_name $MODEL_NAME --lr 3e-4 --seed 42"
 
-# echo "=== Generating fixed batches for $MODEL_NAME ==="
-# python generate_fixed_batches.py "$MODEL_NAME"
+rm -rf ./checkpoints_tp ./checkpoints_tp_resumed ./checkpoints_fsdp ./checkpoints_fsdp_resumed
 
-rm -rf ./checkpoints_tp ./checkpoints_fsdp
+echo "=== Phase 1: Train steps 0-9, save checkpoint ==="
+echo "--- Launching FSDP+TP and FSDP-only in parallel ---"
 
-echo "=== Running FSDP+TP (8 GPUs: fsdp=4, tp=2) then FSDP-only (4 GPUs: fsdp=4) ==="
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29500 \
+  $SCRIPT $COMMON_ARGS --fsdp_size 2 --tp_size 2 --enable_sp \
+  --num_steps 10 --save_dir ./checkpoints_tp > "${LOG_FSDP_TP}.phase1" 2>&1 &
+PID1=$!
 
-echo "--- FSDP+TP ---"
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 --master_port=29500 $SCRIPT $COMMON_ARGS --fsdp_size 4 --tp_size 2 --enable_sp --save_dir ./checkpoints_tp > "$LOG_FSDP_TP" 2>&1
-echo "FSDP+TP done"
+CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=2 --master_port=29501 \
+  $SCRIPT $COMMON_ARGS --fsdp_size 2 \
+  --num_steps 10 --save_dir ./checkpoints_fsdp > "${LOG_FSDP_ONLY}.phase1" 2>&1 &
+PID2=$!
 
-echo "--- FSDP-only ---"
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29501 $SCRIPT $COMMON_ARGS --fsdp_size 4 --save_dir ./checkpoints_fsdp > "$LOG_FSDP_ONLY" 2>&1
-echo "FSDP-only done"
-
+echo "FSDP+TP PID=$PID1 | FSDP-only PID=$PID2"
+wait $PID1 && echo "Phase 1 FSDP+TP done" || { echo "Phase 1 FSDP+TP failed (exit $?)"; cat "${LOG_FSDP_TP}.phase1"; exit 1; }
+wait $PID2 && echo "Phase 1 FSDP-only done" || { echo "Phase 1 FSDP-only failed (exit $?)"; cat "${LOG_FSDP_ONLY}.phase1"; exit 1; }
 
 echo ""
-echo "=== Loss & Grad Diff ==="
+echo "=== Phase 2: Resume from checkpoint, train steps 10-19, save ==="
+echo "--- Launching FSDP+TP and FSDP-only in parallel ---"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29500 \
+  $SCRIPT $COMMON_ARGS --fsdp_size 2 --tp_size 2 --enable_sp \
+  --num_steps 10 --start_step 10 \
+  --resume_dir ./checkpoints_tp --save_dir ./checkpoints_tp_resumed > "${LOG_FSDP_TP}.phase2" 2>&1 &
+PID1=$!
+
+CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=2 --master_port=29501 \
+  $SCRIPT $COMMON_ARGS --fsdp_size 2 \
+  --num_steps 10 --start_step 10 \
+  --resume_dir ./checkpoints_fsdp --save_dir ./checkpoints_fsdp_resumed > "${LOG_FSDP_ONLY}.phase2" 2>&1 &
+PID2=$!
+
+echo "FSDP+TP PID=$PID1 | FSDP-only PID=$PID2"
+wait $PID1 && echo "Phase 2 FSDP+TP done" || { echo "Phase 2 FSDP+TP failed (exit $?)"; cat "${LOG_FSDP_TP}.phase2"; exit 1; }
+wait $PID2 && echo "Phase 2 FSDP-only done" || { echo "Phase 2 FSDP-only failed (exit $?)"; cat "${LOG_FSDP_ONLY}.phase2"; exit 1; }
+
+# Combine phase logs
+cat "${LOG_FSDP_TP}.phase1" "${LOG_FSDP_TP}.phase2" > "$LOG_FSDP_TP"
+cat "${LOG_FSDP_ONLY}.phase1" "${LOG_FSDP_ONLY}.phase2" > "$LOG_FSDP_ONLY"
+
+echo ""
+echo "=== Full Loss & Grad Diff (steps 0-19) ==="
 git diff --no-index --color --word-diff=color "$LOG_FSDP_TP" "$LOG_FSDP_ONLY" || true

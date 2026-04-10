@@ -5,12 +5,12 @@ import contextlib
 import os
 
 import torch
-import torch.distributed.checkpoint as dcp
 from datasets import load_dataset
 from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.distributed import DistributedConfig
+from transformers.distributed.utils import load_optimizer, save_optimizer
 
 def build_packed_dataset(dataset_name, tokenizer, seq_len, dp_rank, dp_world_size):
     """Stream + tokenize + greedy-pack documents into fixed-length (input, label) windows."""
@@ -47,6 +47,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_sp", action="store_true", help="Enable sequence parallelism")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--fixed_batches", action="store_true", help="Use pre-generated fixed batches instead of C4")
+    parser.add_argument("--resume_dir", type=str, default=None, help="Resume from this checkpoint directory")
+    parser.add_argument("--start_step", type=int, default=0, help="Starting step number (for logging)")
     args = parser.parse_args()
 
     torch.distributed.init_process_group(backend="nccl")
@@ -65,8 +67,9 @@ if __name__ == "__main__":
         dc_kwargs["enable_sequence_parallel"] = True
     distributed_config = DistributedConfig(**dc_kwargs)
 
+    load_path = args.resume_dir if args.resume_dir else args.model_name
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
+        load_path,
         distributed_config=distributed_config,
         torch_dtype=torch.bfloat16,
     )
@@ -92,8 +95,14 @@ if __name__ == "__main__":
         train_context = contextlib.nullcontext
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    if args.resume_dir:
+        load_optimizer(optimizer, os.path.join(args.resume_dir, "optimizer"))
+        if rank == 0:
+            print(f"Resumed optimizer from {args.resume_dir}")
+
     model.train()
-    for step in range(args.num_steps):
+    for step in range(args.start_step, args.start_step + args.num_steps):
         if args.fixed_batches:
             input_ids = fixed[step]["input_ids"].to(f"cuda:{local_rank}")
             labels = fixed[step]["labels"].to(f"cuda:{local_rank}")
@@ -125,7 +134,7 @@ if __name__ == "__main__":
 
     # Save model (HF format) and optimizer (DCP)
     model.save_pretrained(args.save_dir)
-    dcp.save({"optimizer": optimizer.state_dict()}, checkpoint_id=os.path.join(args.save_dir, "optimizer"))
+    save_optimizer(optimizer, os.path.join(args.save_dir, "optimizer"))
 
     if rank == 0:
         print(f"Saved to {args.save_dir}")

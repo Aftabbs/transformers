@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 if is_torch_available():
     import torch
+    import torch.distributed.checkpoint as dcp
+
+    from ..integrations.tensor_parallel import convert_strided_to_shard, restore_strided_from_shard
 
 
 def is_fsdp_enabled() -> bool:
@@ -110,3 +113,23 @@ def init_device_mesh(distributed_config: DistributedConfig) -> torch.distributed
         mesh._flatten("_".join(names))
 
     return mesh
+
+
+def save_optimizer(optimizer, checkpoint_dir: str) -> None:
+    # Save optimizer state via DCP, handling _StridedShard placements transparently.
+    osd = optimizer.state_dict()
+    placement_map = convert_strided_to_shard(osd)
+    dcp.save({"optimizer": osd}, checkpoint_id=checkpoint_dir)
+    if placement_map and torch.distributed.get_rank() == 0:
+        torch.save(placement_map, os.path.join(checkpoint_dir, "placement_map.pt"))
+
+
+def load_optimizer(optimizer, checkpoint_dir: str) -> None:
+    # Load optimizer state via DCP, restoring _StridedShard placements transparently.
+    osd = optimizer.state_dict()
+    dcp.load({"optimizer": osd}, checkpoint_id=checkpoint_dir)
+    pmap_path = os.path.join(checkpoint_dir, "placement_map.pt")
+    if os.path.exists(pmap_path):
+        placement_map = torch.load(pmap_path, weights_only=False)
+        restore_strided_from_shard(osd, placement_map)
+    optimizer.load_state_dict(osd)
